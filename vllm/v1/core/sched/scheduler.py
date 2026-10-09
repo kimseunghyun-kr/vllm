@@ -220,11 +220,11 @@ class Scheduler(SchedulerInterface):
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
         # Priority queues for requests.
-        self.waiting = create_request_queue(self.policy)
+        self.waiting = self._create_waiting_request_queue()
         # Waiting requests that hold KV blocks are always drained before
         # self.waiting: a block-holder must never sit behind a request whose
         # failed allocation would stop the scheduling scan.
-        self.kv_holding_waiting = create_request_queue(self.policy)
+        self.kv_holding_waiting = self._create_waiting_request_queue()
         # Waiting requests that are deferred, i.e. were skipped by the scheduling
         # scan or enqueued in a blocked status.
         self.deferred_waiting: set[Request] = set()
@@ -2458,6 +2458,29 @@ class Scheduler(SchedulerInterface):
             self.kv_holding_waiting.add_request(request)
         else:
             self.waiting.add_request(request)
+
+    def _create_waiting_request_queue(self) -> RequestQueue:
+        return create_request_queue(
+            self.policy,
+            residual_cost_fn=self._get_residual_sjf_cost,
+            residual_sjf_max_wait_ms=self.scheduler_config.residual_sjf_max_wait_ms,
+            residual_sjf_longest_first=(
+                self.scheduler_config.residual_sjf_longest_first
+            ),
+        )
+
+    def _get_residual_sjf_cost(self, request: Request) -> int:
+        # Measure cached work in tokens (the coordinator's hit length) so the
+        # cost stays consistent across KV cache groups with different block
+        # sizes, then quantize to scheduler blocks for stable tie-breaking.
+        num_computed_tokens = self.kv_cache_manager.get_num_local_computed_tokens(
+            request
+        )
+        num_computed_blocks = (
+            num_computed_tokens + self.block_size - 1
+        ) // self.block_size
+        num_total_blocks = (request.num_tokens + self.block_size - 1) // self.block_size
+        return max(0, num_total_blocks - num_computed_blocks)
 
     def _handle_stopped_request(self, request: Request) -> bool:
         """Return True if finished (can be False for resumable requests)."""
