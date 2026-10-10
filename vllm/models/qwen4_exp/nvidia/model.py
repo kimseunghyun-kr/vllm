@@ -830,6 +830,13 @@ class Qwen4ExpForCausalLM(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return this TP rank's vocab shard of the logits, without a gather.
+
+        Batch-sharded sampling exchanges the shards with an all-to-all.
+        """
+        return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.model._mtp_hidden_buffer
 
