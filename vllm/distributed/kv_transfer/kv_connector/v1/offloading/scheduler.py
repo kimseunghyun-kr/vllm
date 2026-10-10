@@ -30,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import eagle_proof_margin
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.kv_cache_interface import (
@@ -300,7 +301,8 @@ class SchedulerOffloadConfig(NamedTuple):
         )
         # Partial tails currently require one physical block per offload chunk
         # and uniform, non-windowed groups so one boundary identifies every
-        # group's source. EAGLE and DCP need additional hand-off semantics.
+        # group's source. EAGLE groups key their partial tail at a proof
+        # position past the boundary. DCP needs additional hand-off semantics.
         supports_partial_tail = (
             spec.blocks_per_chunk == 1
             and len(group_block_sizes) == 1
@@ -310,7 +312,6 @@ class SchedulerOffloadConfig(NamedTuple):
                 or config.requires_cow_source
                 for config in kv_group_configs
             )
-            and not any(config.is_eagle_group for config in kv_group_configs)
             and vllm_config.parallel_config.decode_context_parallel_size == 1
         )
 
@@ -601,6 +602,22 @@ class OffloadingConnectorScheduler:
         self._partial_tail_block_size = (
             self.config.kv_group_configs[0].tokens_per_block
             if self.config.supports_partial_tail
+            else 0
+        )
+        # Core's prefix cache matches an EAGLE group this many tokens past a
+        # fine-grained hit and then drops them. A partial tail stores and looks
+        # up EAGLE groups at that proof position. Zero without such groups.
+        self._eagle_proof_margin = (
+            eagle_proof_margin(
+                self._partial_tail_block_size,
+                self.config.tokens_per_hash,
+                fine_grained_lookup=True,
+            )
+            if self.config.supports_partial_tail
+            and any(
+                config.is_eagle_group and not config.requires_cow_source
+                for config in self.config.kv_group_configs
+            )
             else 0
         )
         self._cow_source_groups = frozenset(
@@ -976,8 +993,20 @@ class OffloadingConnectorScheduler:
         local_tokens = req_status.num_locally_computed_tokens
         complete_boundary = local_tokens + complete_hit
         tokens_per_hash = self.config.tokens_per_hash
-        block_end = complete_boundary + self._partial_tail_block_size
+        # A partial tail carries its own EAGLE proof, so it may also lie in
+        # the block after the chunk that the complete-chunk lookup pops.
+        num_search_blocks = 2 if self._eagle_proof_margin else 1
+        block_end = complete_boundary + (
+            num_search_blocks * self._partial_tail_block_size
+        )
         max_boundary = min(req_status.req.num_prompt_tokens - 1, block_end - 1)
+        if self._eagle_proof_margin:
+            # The proof key needs a hash of this request past the boundary.
+            max_boundary = min(
+                max_boundary,
+                len(req_status.req.block_hashes) * tokens_per_hash
+                - self._eagle_proof_margin,
+            )
         if max_num_new_tokens is not None:
             max_boundary = min(max_boundary, local_tokens + max_num_new_tokens)
         if req_status.max_load_tokens is not None:
@@ -991,38 +1020,81 @@ class OffloadingConnectorScheduler:
 
         pending = False
         for boundary in range(max_boundary, complete_boundary, -tokens_per_hash):
-            boundary_pending = False
-            boundary_missed = False
-            boundary_keys = []
-            for group_config in self.config.kv_group_configs:
-                key = self._make_boundary_key(
-                    req_status.req,
-                    group_config.group_idx,
-                    boundary,
-                    req_status.req_context,
-                )
-                boundary_keys.append(key)
-                result = self.manager.lookup(key, req_status.req_context)
-                if result is LookupResult.MISS:
-                    boundary_missed = True
-                    break
-                if result in (LookupResult.HIT_PENDING, LookupResult.RETRY):
-                    boundary_pending = True
-
-            pending |= boundary_pending
-            if not boundary_missed and not boundary_pending:
-                for group_config, key in zip(
-                    self.config.kv_group_configs, boundary_keys
-                ):
-                    self._events_tracker.record_partial_lookup(
-                        req_status.req, group_config, boundary, key
-                    )
+            hit, boundary_pending = self._lookup_partial_tail(
+                req_status, boundary, complete_boundary
+            )
+            if hit:
                 req_status.partial_tail_boundary = boundary
                 return boundary - local_tokens
+            pending |= boundary_pending
 
         if pending and complete_hit == 0:
             return None
         return complete_hit
+
+    def _partial_tail_key_tokens(
+        self, group_config: GroupOffloadConfig, boundary: int
+    ) -> int:
+        """Token position whose hash keys a group's partial-tail block."""
+        if group_config.is_eagle_group and not group_config.requires_cow_source:
+            return boundary + self._eagle_proof_margin
+        return boundary
+
+    def _lookup_partial_tail(
+        self,
+        req_status: RequestOffloadState,
+        boundary: int,
+        complete_boundary: int,
+    ) -> tuple[bool, bool]:
+        """Look up every key a partial-tail hit at ``boundary`` loads.
+
+        Returns ``(hit, pending)``. ``hit`` is True only if every key is ready.
+        ``pending`` is True if a key looked up before the first miss is not
+        ready yet. A boundary past the block that follows ``complete_boundary``
+        also needs that block's complete chunk in every non-recurrent group.
+        """
+        req = req_status.req
+        req_context = req_status.req_context
+        block_size = self._partial_tail_block_size
+        bridge_chunk_idx = complete_boundary // block_size
+        bridge_keys = [
+            (group_config, group_state.offload_keys[bridge_chunk_idx])
+            for group_config, group_state in zip(
+                self.config.kv_group_configs, req_status.group_states
+            )
+            if boundary // block_size > bridge_chunk_idx
+            and not group_config.requires_cow_source
+        ]
+        pending = any(
+            key in (self._chunks_being_loaded or ()) for _, key in bridge_keys
+        )
+        for _, key in bridge_keys:
+            result = self.manager.lookup(key, req_context)
+            if result is LookupResult.MISS:
+                return False, pending
+            pending |= result is not LookupResult.HIT
+
+        boundary_keys: list[tuple[GroupOffloadConfig, int, OffloadKey]] = []
+        for group_config in self.config.kv_group_configs:
+            key_tokens = self._partial_tail_key_tokens(group_config, boundary)
+            key = self._make_boundary_key(
+                req, group_config.group_idx, key_tokens, req_context
+            )
+            result = self.manager.lookup(key, req_context)
+            if result is LookupResult.MISS:
+                return False, pending
+            pending |= result is not LookupResult.HIT
+            boundary_keys.append((group_config, key_tokens, key))
+
+        if pending:
+            return False, True
+        for group_config, key in bridge_keys:
+            self._events_tracker.record_lookup(req, group_config, bridge_chunk_idx, key)
+        for group_config, key_tokens, key in boundary_keys:
+            self._events_tracker.record_partial_lookup(
+                req, group_config, key_tokens, key
+            )
+        return True, False
 
     def on_new_request(self, request: Request) -> None:
         """Called when a new request is added to the scheduler."""
@@ -1217,7 +1289,9 @@ class OffloadingConnectorScheduler:
                         self._make_boundary_key(
                             request,
                             group_config.group_idx,
-                            partial_tail_boundary,
+                            self._partial_tail_key_tokens(
+                                group_config, partial_tail_boundary
+                            ),
                             req_status.req_context,
                         )
                     )
@@ -1442,6 +1516,13 @@ class OffloadingConnectorScheduler:
             assert boundary % self.config.tokens_per_hash == 0
             assert boundary <= max_boundary
 
+            if (
+                self._eagle_proof_margin
+                and boundary + self._eagle_proof_margin > req.num_computed_tokens
+            ):
+                # The EAGLE proof is not computed yet.
+                continue
+
             cow_blocks = {group_idx: block_id for group_idx, block_id, _ in entries}
             assert self._cow_source_groups.issubset(cow_blocks)
 
@@ -1453,11 +1534,15 @@ class OffloadingConnectorScheduler:
                 for group in self.config.kv_group_configs
             ):
                 continue
+            key_tokens = [
+                self._partial_tail_key_tokens(group, boundary)
+                for group in self.config.kv_group_configs
+            ]
             keys = [
                 self._make_boundary_key(
-                    req, group.group_idx, boundary, req_status.req_context
+                    req, group.group_idx, tokens, req_status.req_context
                 )
-                for group in self.config.kv_group_configs
+                for group, tokens in zip(self.config.kv_group_configs, key_tokens)
             ]
             block_ids = [
                 cow_blocks[group.group_idx]
@@ -1476,10 +1561,12 @@ class OffloadingConnectorScheduler:
             if not store_output.keys_to_store:
                 continue
 
-            for group_config, key in zip(self.config.kv_group_configs, keys):
+            for group_config, tokens, key in zip(
+                self.config.kv_group_configs, key_tokens, keys
+            ):
                 if key in store_output.keys_to_store:
                     self._events_tracker.record_partial_store(
-                        req, group_config, boundary, key
+                        req, group_config, tokens, key
                     )
 
             group_by_key = {key: idx for idx, key in enumerate(keys)}
