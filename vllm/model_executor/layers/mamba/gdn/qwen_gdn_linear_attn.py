@@ -1593,11 +1593,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # when decodes are peeled off, else the full non-spec batch), so they
             # don't need to be re-derived per layer.
             prefill_state_indices = attn_metadata.prefill_state_indices
-            prefill_has_initial_state = attn_metadata.prefill_has_initial_state
+            no_initial_state_mask = attn_metadata.prefill_no_initial_state_mask
             assert prefill_state_indices is not None
-            assert prefill_has_initial_state is not None
-            initial_state = ssm_state[prefill_state_indices]
-            initial_state[~prefill_has_initial_state, ...] = 0
+            assert no_initial_state_mask is not None
+            initial_state = ssm_state.index_select(0, prefill_state_indices)
+            initial_state.masked_fill_(no_initial_state_mask, 0)
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1616,7 +1616,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 aiter_prefill_metadata=attn_metadata.aiter_prefill_metadata,
             )
             # Init cache
-            ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+            ssm_state.index_copy_(
+                0, prefill_state_indices, last_recurrent_state.to(ssm_state.dtype)
+            )
 
             if split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill
