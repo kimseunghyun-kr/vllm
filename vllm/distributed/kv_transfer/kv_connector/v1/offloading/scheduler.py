@@ -1516,12 +1516,19 @@ class OffloadingConnectorScheduler:
             assert boundary % self.config.tokens_per_hash == 0
             assert boundary <= max_boundary
 
-            if (
-                self._eagle_proof_margin
-                and boundary + self._eagle_proof_margin > req.num_computed_tokens
-            ):
-                # The EAGLE proof is not computed yet.
-                continue
+            if self._eagle_proof_margin:
+                # The CoW hand-off arrives on the step that computes the prompt
+                # tokens past the boundary, and it is not offered again. Workers
+                # submit a store at the next step's start, after this step's
+                # forward, so count the prompt tokens this step computes.
+                num_prompt_tokens_after_step = min(
+                    req.num_computed_tokens
+                    + scheduler_output.num_scheduled_tokens.get(req_id, 0),
+                    req.num_prompt_tokens,
+                )
+                if boundary + self._eagle_proof_margin > num_prompt_tokens_after_step:
+                    # The EAGLE proof is not computed by the end of this step.
+                    continue
 
             cow_blocks = {group_idx: block_id for group_idx, block_id, _ in entries}
             assert self._cow_source_groups.issubset(cow_blocks)

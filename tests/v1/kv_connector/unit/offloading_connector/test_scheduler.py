@@ -905,11 +905,12 @@ def test_eagle_partial_tail_store_keys_attention_at_proof():
     )
 
     output = SimpleNamespace(
+        num_scheduled_tokens={},
         kv_connector_block_state=KVConnectorBlockState(
             req_ids=set(),
             resolve_block_ids={}.__getitem__,
             boundary_state_offloads={"req": [(1, 99, 24)]},
-        )
+        ),
     )
     jobs = scheduler._build_partial_tail_store_jobs(output)
 
@@ -937,8 +938,13 @@ def test_eagle_partial_tail_store_keys_attention_at_proof():
     assert events_by_group[0].token_ids == list(range(16, 28))
 
 
-@pytest.mark.parametrize("num_computed_tokens", [24, 27])
-def test_eagle_partial_tail_store_skips_tail_without_proof(num_computed_tokens):
+@pytest.mark.parametrize(
+    ("num_computed_tokens", "num_scheduled_tokens"), [(24, 0), (27, 0), (24, 3)]
+)
+def test_eagle_partial_tail_store_skips_tail_without_proof(
+    num_computed_tokens, num_scheduled_tokens
+):
+    """No store when the proof at 28 is not computed by the end of the step."""
     scheduler = _make_partial_tail_scheduler(eagle=True)
     request = _make_partial_tail_request(scheduler)
     request.num_computed_tokens = num_computed_tokens
@@ -947,11 +953,12 @@ def test_eagle_partial_tail_store_skips_tail_without_proof(num_computed_tokens):
     req_status.group_states[1].block_ids[:] = [0, 21]
 
     output = SimpleNamespace(
+        num_scheduled_tokens={"req": num_scheduled_tokens},
         kv_connector_block_state=KVConnectorBlockState(
             req_ids=set(),
             resolve_block_ids={}.__getitem__,
             boundary_state_offloads={"req": [(1, 99, 24)]},
-        )
+        ),
     )
 
     assert scheduler._build_partial_tail_store_jobs(output) == {}
@@ -1010,11 +1017,14 @@ def test_eagle_partial_lookup_loads_attention_proof(missing):
     assert dst_spec.group_sizes == [2, 1]
 
 
-def test_eagle_partial_tail_round_trip_serves_mamba_checkpoint():
+@pytest.mark.parametrize("cow_on_proof_step", [False, True])
+def test_eagle_partial_tail_round_trip_serves_mamba_checkpoint(cow_on_proof_step):
     """Store, finish and resend a 30-token prompt with an EAGLE group.
 
     The resend hits the Mamba checkpoint at 24 only through the EAGLE
-    group's proof key at 28.
+    group's proof key at 28. With ``cow_on_proof_step``, the steps follow core:
+    the prefill stops at 24, and the CoW hand-off arrives on the step that
+    computes tokens 24-30.
     """
     scheduler = _make_partial_tail_scheduler(eagle=True)
     stored: set = set()
@@ -1053,9 +1063,15 @@ def test_eagle_partial_tail_round_trip_serves_mamba_checkpoint():
     producer_status = scheduler._req_status["req"]
     producer_status.group_states[0].block_ids[:] = [11, 12]
     producer_status.group_states[1].block_ids[:] = [0, 21]
-    run_step({"req": 30})
-    producer.num_computed_tokens = 30
-    run_step({"req": 1}, handoffs={"req": [(1, 99, 24)]})
+    if cow_on_proof_step:
+        run_step({"req": 24})
+        producer.num_computed_tokens = 24
+        run_step({"req": 6}, handoffs={"req": [(1, 99, 24)]})
+        producer.num_computed_tokens = 30
+    else:
+        run_step({"req": 30})
+        producer.num_computed_tokens = 30
+        run_step({"req": 1}, handoffs={"req": [(1, 99, 24)]})
     producer.is_finished.return_value = True
     scheduler.request_finished(producer)
     run_step({}, finished={"req"})
