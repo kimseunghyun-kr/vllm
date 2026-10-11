@@ -83,6 +83,8 @@ class GDNAttentionMetadata:
     # Chunk-kernel inputs for prefill
     prefill_query_start_loc: torch.Tensor | None = None
     prefill_state_indices: torch.Tensor | None = None
+    # prefill_state_indices as int64, for index_copy_ into the SSM state.
+    prefill_state_indices_int64: torch.Tensor | None = None
     prefill_has_initial_state: torch.Tensor | None = None
     # ~prefill_has_initial_state as [num_prefills, 1, 1, 1], to zero the
     # gathered [num_prefills, HV, V, K] initial states in one masked_fill_.
@@ -472,6 +474,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         chunk_offsets: torch.Tensor | None = None
         prefill_query_start_loc: torch.Tensor | None = None
         prefill_state_indices: torch.Tensor | None = None
+        prefill_state_indices_int64: torch.Tensor | None = None
         prefill_has_initial_state: torch.Tensor | None = None
         prefill_no_initial_state_mask: torch.Tensor | None = None
         aiter_prefill_metadata: object | None = None
@@ -495,6 +498,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 prefill_query_start_loc = non_spec_query_start_loc
                 prefill_query_start_loc_cpu = non_spec_query_start_loc_cpu
                 prefill_state_indices = non_spec_state_indices_tensor
+            assert prefill_state_indices is not None
+            prefill_state_indices_int64 = prefill_state_indices.to(torch.int64)
 
             if self.gdn_prefill_backend == "aiter_flydsl":
                 # AITER carries its own reusable varlen metadata and has no use
@@ -624,6 +629,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             chunk_offsets=chunk_offsets,
             prefill_query_start_loc=prefill_query_start_loc,
             prefill_state_indices=prefill_state_indices,
+            prefill_state_indices_int64=prefill_state_indices_int64,
             prefill_has_initial_state=prefill_has_initial_state,
             prefill_no_initial_state_mask=prefill_no_initial_state_mask,
             aiter_prefill_metadata=aiter_prefill_metadata,
@@ -726,6 +732,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_state_indices_tensor=spec_indices,
             non_spec_state_indices_tensor=non_spec_indices,
             prefill_state_indices=prefill_indices,
+            prefill_state_indices_int64=(
+                None if prefill_indices is None else prefill_indices.to(torch.int64)
+            ),
             checkpoint=checkpoint,
         )
 
