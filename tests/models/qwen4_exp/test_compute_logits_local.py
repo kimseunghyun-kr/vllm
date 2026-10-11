@@ -2,14 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Qwen4Exp exposes vocab-shard logits for batch-sharded sampling."""
 
-import pytest
 import torch
 from torch import nn
 
-from vllm.models.qwen4_exp.amd import model as amd_model
-from vllm.models.qwen4_exp.nvidia import model as nvidia_model
-
-MODEL_MODULES = {"nvidia": nvidia_model, "amd": amd_model}
+# NVIDIA only: the NVIDIA and AMD model modules register the same custom ops.
+from vllm.models.qwen4_exp.nvidia import model
 
 
 def _causal_lm_with_recording_processor(model_cls):
@@ -28,25 +25,21 @@ def _causal_lm_with_recording_processor(model_cls):
     return model, calls
 
 
-@pytest.mark.parametrize("platform", ["nvidia", "amd"])
-def test_compute_logits_local_skips_gather(platform: str) -> None:
-    module = MODEL_MODULES[platform]
-    model, calls = _causal_lm_with_recording_processor(module.Qwen4ExpForCausalLM)
+def test_compute_logits_local_skips_gather() -> None:
+    causal_lm, calls = _causal_lm_with_recording_processor(model.Qwen4ExpForCausalLM)
     hidden_states = torch.tensor([4.0])
 
-    result = model.compute_logits_local(hidden_states)
+    result = causal_lm.compute_logits_local(hidden_states)
 
     assert torch.equal(result, torch.tensor([5.0]))
-    assert calls == [(model.lm_head, hidden_states, True)]
+    assert calls == [(causal_lm.lm_head, hidden_states, True)]
 
 
-@pytest.mark.parametrize("platform", ["nvidia", "amd"])
-def test_vl_wrapper_delegates_compute_logits_local(platform: str) -> None:
-    module = MODEL_MODULES[platform]
+def test_vl_wrapper_delegates_compute_logits_local() -> None:
     language_model, calls = _causal_lm_with_recording_processor(
-        module.Qwen4ExpForCausalLM
+        model.Qwen4ExpForCausalLM
     )
-    wrapper = object.__new__(module.Qwen4ExpForConditionalGeneration)
+    wrapper = object.__new__(model.Qwen4ExpForConditionalGeneration)
     nn.Module.__init__(wrapper)
     wrapper.language_model = language_model
     hidden_states = torch.tensor([1.0])
