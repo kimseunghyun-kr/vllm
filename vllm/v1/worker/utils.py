@@ -303,7 +303,14 @@ class AttentionGroup:
         device,
         kernel_block_size: int | None = None,
         num_metadata_builders: int = 1,
+        block_table_width: int | None = None,
     ):
+        """Create the metadata builders and the kernel block table.
+
+        ``block_table_width`` is the row width, in manager blocks, of the KV
+        cache group's block table. Give it when the group spec can differ from
+        this group's layer spec; otherwise the layer spec sets the width.
+        """
         spec = self.kv_cache_spec
         if kernel_block_size is not None and isinstance(spec, AttentionSpec):
             # A backend in a packed KV cache group may need smaller blocks than
@@ -322,10 +329,14 @@ class AttentionGroup:
         builder_cls = self.backend.get_builder_cls()
         builder_kwargs = {}
         if builder_cls.requires_block_table_width or self.kernel_block_size is not None:
-            max_num_blocks = self.kv_cache_spec.max_num_blocks_per_req(
-                vllm_config, vllm_config.model_config.max_model_len
-            )
-            width = get_block_table_width(max_num_blocks, self.kv_cache_spec.block_size)
+            if block_table_width is None:
+                max_num_blocks = self.kv_cache_spec.max_num_blocks_per_req(
+                    vllm_config, vllm_config.model_config.max_model_len
+                )
+                block_table_width = get_block_table_width(
+                    max_num_blocks, self.kv_cache_spec.block_size
+                )
+            width = block_table_width
             if kernel_block_size is not None:
                 width *= self.kv_cache_spec.block_size // kernel_block_size
             if builder_cls.requires_block_table_width:

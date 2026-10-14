@@ -28,6 +28,10 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
+from vllm.v1.worker.block_table import (
+    get_block_table_width,
+    get_kv_cache_group_block_table_width,
+)
 from vllm.v1.worker.utils import (
     AttentionGroup,
     allocate_kv_cache,
@@ -328,6 +332,53 @@ def test_packed_replicated_selector_maps_two_manager_blocks_without_aliasing() -
     assert restored.shape == raw_selector.shape
     assert restored.stride() == raw_selector.stride()
     assert torch.equal(restored, raw_selector)
+
+
+def test_production_shape_group_rows_are_wider_than_selector_rows() -> None:
+    """Block 480, DCP 4 and 262144 tokens give 140 group columns, not 137."""
+    dcp_world_size = 4
+    max_len = 262144
+    config = _config(dcp_world_size)
+    main = replace(_main_kv(), block_size=480)
+    selector = _IndependentSelectorWithoutGenericSlots(
+        block_size=480 * dcp_world_size,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        tokens_per_state=8,
+        dcp_sharded=False,
+    )
+    group = UniformTypeKVCacheSpecs.from_specs(
+        {"main": main, "selector": selector}, dcp_world_size
+    )
+    assert group is not None
+    assert get_kv_cache_group_block_table_width(group, config, max_len) == 140
+    own_rows = get_block_table_width(
+        selector.max_num_blocks_per_req(config, max_len), selector.block_size
+    )
+    assert own_rows == 137
+
+
+def test_replicated_selector_maps_full_group_block_table_rows() -> None:
+    """The kernel block table must hold rows as wide as the group's rows."""
+    dcp_world_size = 4
+    run = _packed_qsa_views(dcp_world_size)
+    max_len = run.config.model_config.max_model_len
+    group_width = get_kv_cache_group_block_table_width(
+        run.groups[0].kv_cache_spec, run.config, max_len
+    )
+    # Block 784 aligns to 8 blocks; the selector's 3136-token blocks to 2.
+    assert group_width == 8
+    run.selector_group.create_metadata_builders(
+        run.config,
+        torch.device("cpu"),
+        kernel_block_size=BLOCK_SIZE,
+        block_table_width=group_width,
+    )
+    block_table = torch.arange(group_width, dtype=torch.int32).unsqueeze(0)
+    kernel_table = run.selector_group.map_to_kernel_block_table(block_table)
+    assert kernel_table.shape == (1, group_width * dcp_world_size)
+    assert kernel_table[0, -1] == (group_width - 1) * dcp_world_size + 3
 
 
 def test_dcp1_packed_selector_keeps_its_original_view() -> None:

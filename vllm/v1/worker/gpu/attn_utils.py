@@ -35,6 +35,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.worker.block_table import get_kv_cache_group_block_table_width
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.ubatch_utils import get_num_ubatches
 from vllm.v1.worker.utils import (
@@ -287,11 +288,19 @@ def init_attn_backend(
         kernel_block_size: int | None = None
         if kv_cache_group_id < len(kernel_block_sizes):
             kernel_block_size = kernel_block_sizes[kv_cache_group_id]
+        # A replicated layer in a DCP-sharded group has larger blocks than the
+        # group, so its own spec can give a narrower row than the runner's.
+        block_table_width = get_kv_cache_group_block_table_width(
+            kv_cache_config.kv_cache_groups[kv_cache_group_id].kv_cache_spec,
+            vllm_config,
+            vllm_config.model_config.max_model_len,
+        )
         for group in groups:
             group.create_metadata_builders(
                 vllm_config=vllm_config,
                 device=device,
                 kernel_block_size=kernel_block_size,
+                block_table_width=block_table_width,
                 # Microbatches build attention metadata concurrently, and some
                 # builders keep the prepared metadata on themselves (MLA stores
                 # it on the prefill backend), so each ubatch needs its own.

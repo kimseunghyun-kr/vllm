@@ -4,7 +4,7 @@
 import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -23,6 +23,10 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.utils import CpuGpuBuffer
 
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.v1.kv_cache_interface import KVCacheSpec
+
 logger = init_logger(__name__)
 
 
@@ -39,6 +43,22 @@ def get_block_table_width(
         block_alignment = token_alignment // math.gcd(token_alignment, block_size)
         max_num_blocks = cdiv(max_num_blocks, block_alignment) * block_alignment
     return max_num_blocks
+
+
+def get_kv_cache_group_block_table_width(
+    kv_cache_group_spec: "KVCacheSpec", vllm_config: "VllmConfig", max_len: int
+) -> int:
+    """Return the row width, in manager blocks, of a KV cache group's block table.
+
+    Every layer view in the group receives rows of this width, also when its
+    own spec has a different block size (a replicated cache in a DCP-sharded
+    group).
+    """
+    return get_block_table_width(
+        kv_cache_group_spec.max_num_blocks_per_req(vllm_config, max_len),
+        kv_cache_group_spec.block_size,
+        token_alignment=kv_cache_group_spec.block_table_token_alignment,
+    )
 
 
 class SlotMappingMode(Enum):
