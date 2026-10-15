@@ -21,6 +21,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
+    plan_flashinfer_checkpoints,
 )
 from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -245,6 +246,7 @@ def test_update_block_table_matches_build(
         "spec_state_indices_tensor",
         "non_spec_state_indices_tensor",
         "prefill_state_indices",
+        "prefill_state_indices_int64",
     )
     source_indices = [getattr(source, f) for f in fields]
     source_indices = [t if t is None else t.clone() for t in source_indices]
@@ -274,6 +276,63 @@ def test_has_initial_state_after_reclassification():
     assert meta.has_initial_state is not None
     # req0 has context_lens = 65 - 1 = 64 > 0, so has_initial_state[0] = True
     assert meta.has_initial_state[0].item() is True
+
+
+@pytest.mark.parametrize(
+    "test_case", GDN_BUILD_TEST_CASES.values(), ids=GDN_BUILD_TEST_CASES.keys()
+)
+def test_prefill_state_indices_int64_matches_prefill_state_indices(
+    test_case: GDNBuildTestCase,
+):
+    """The int64 copy (for index_copy_) holds the same prefill state indices."""
+    builder = _create_gdn_builder(test_case.num_speculative_tokens)
+    batch = BatchSpec(seq_lens=test_case.seq_lens, query_lens=test_case.query_lens)
+    meta = _build(builder, batch, test_case.num_decode_draft_tokens)
+
+    if meta.prefill_state_indices is None:
+        assert meta.prefill_state_indices_int64 is None
+        return
+    assert meta.prefill_state_indices_int64 is not None
+    assert meta.prefill_state_indices_int64.dtype == torch.int64
+    assert torch.equal(
+        meta.prefill_state_indices_int64, meta.prefill_state_indices.to(torch.int64)
+    )
+
+
+@pytest.mark.parametrize(
+    "seq_lens,query_lens,draft_tokens,expected",
+    [
+        pytest.param([20, 30, 100], [3, 2, 50], [2, 1, -1], True, id="spec-first"),
+        pytest.param(
+            [20, 65, 100], [3, 1, 50], [2, -1, -1], True, id="spec-first-reclassified"
+        ),
+        pytest.param([100, 20], [50, 3], [-1, 2], False, id="prefill-first"),
+        pytest.param(
+            [20, 100, 30], [3, 50, 3], [2, -1, 2], False, id="spec-interleaved"
+        ),
+    ],
+)
+def test_spec_tokens_first_matches_token_indices(
+    seq_lens: list[int],
+    query_lens: list[int],
+    draft_tokens: list[int],
+    expected: bool,
+):
+    """spec_tokens_first holds exactly when the gather indices are two ranges."""
+    builder = _create_gdn_builder(num_speculative_tokens=2)
+    batch = BatchSpec(seq_lens=seq_lens, query_lens=query_lens)
+    meta = _build(builder, batch, num_decode_draft_tokens=draft_tokens)
+
+    assert meta.num_prefills > 0 and meta.num_spec_decodes > 0
+    assert meta.spec_token_indx is not None
+    assert meta.non_spec_token_indx is not None
+    num_spec_tokens = meta.num_spec_decode_tokens
+    num_tokens = batch.compute_num_tokens()
+    is_two_ranges = meta.spec_token_indx.tolist() == list(
+        range(num_spec_tokens)
+    ) and meta.non_spec_token_indx.tolist() == list(range(num_spec_tokens, num_tokens))
+    assert meta.spec_tokens_first is expected
+    assert is_two_ranges is expected
 
 
 def test_full_cudagraph_spec_metadata_uses_request_count():
@@ -488,3 +547,20 @@ def test_update_block_table_regathers_checkpoint(num_spec):
     assert not torch.equal(
         actual.checkpoint.state_indices, source.checkpoint.state_indices
     )
+
+
+def test_plan_flashinfer_checkpoints_selects_the_state_at_each_offset():
+    """Each checkpoint row maps to the state FlashInfer emits at its offset.
+
+    The leading decode row is not in the prefill kernel and never checkpoints;
+    the 50-token prefill is shorter than the stride and emits no states.
+    """
+    every_n_tokens, cu_starts, rows = plan_flashinfer_checkpoints(
+        offsets=[0, 128, 0, 192], query_lens=[200, 50, 300]
+    )
+
+    assert every_n_tokens == 64
+    assert cu_starts == [0, 3, 3, 7]
+    # Row 1: state after 128 tokens of the first prefill. Row 3: after 192
+    # tokens of the third prefill, whose states start at index 3.
+    assert rows == [0, 1, 0, 5]

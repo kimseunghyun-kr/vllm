@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
+import math
 from dataclasses import dataclass, replace
 from typing import Literal
 
@@ -27,6 +28,47 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+
+# FlashInfer's GDN prefill emits states every N tokens, N a multiple of its
+# 64-token chunk, so checkpoint offsets must be multiples of 64.
+FLASHINFER_GDN_CHECKPOINT_ALIGNMENT = 64
+
+
+def plan_flashinfer_checkpoints(
+    offsets: list[int], query_lens: list[int]
+) -> tuple[int, list[int], list[int]]:
+    """Lay out internal checkpoints as FlashInfer GDN prefill emits them.
+
+    Args:
+        offsets: Checkpoint offset into each checkpoint row's query, 0 for
+            none. The last ``len(query_lens)`` rows are the prefill kernel's.
+        query_lens: Query length of each sequence the prefill kernel runs.
+
+    Returns:
+        ``(every_n_tokens, cu_starts, rows)``: the stride shared by every
+        checkpoint in the batch, cumulative per-sequence checkpoint counts,
+        and the index of each checkpoint row's state among the emitted ones.
+
+    """
+    every_n_tokens = math.gcd(*offsets)
+    cu_starts = [0]
+    for query_len in query_lens:
+        cu_starts.append(cu_starts[-1] + query_len // every_n_tokens)
+    first = len(offsets) - len(query_lens)
+    rows = [0] * len(offsets)
+    for i, offset in enumerate(offsets[first:]):
+        if offset:
+            rows[first + i] = cu_starts[i] + offset // every_n_tokens - 1
+    return every_n_tokens, cu_starts, rows
+
+
+@dataclass
+class GDNFlashInferCheckpointPlan:
+    every_n_tokens: int
+    num_checkpoints: int
+    cu_starts: torch.Tensor
+    # Per checkpoint row, its state among the ``num_checkpoints`` emitted.
+    rows: torch.Tensor
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -54,6 +96,7 @@ class GDNAttentionMetadata:
     num_actual_tokens: int
 
     checkpoint: MambaPrefillCheckpointMetadata | None = None
+    flashinfer_checkpoint_plan: GDNFlashInferCheckpointPlan | None = None
     has_initial_state: torch.Tensor | None = None
 
     spec_query_start_loc: torch.Tensor | None = None  # shape: [num_spec_decodes + 1,]
@@ -69,6 +112,10 @@ class GDNAttentionMetadata:
     spec_sequence_masks_cpu: torch.Tensor | None = None  # shape: [batch,]
     spec_token_indx: torch.Tensor | None = None
     non_spec_token_indx: torch.Tensor | None = None
+    # True when a batch with spec decodes and prefills puts every spec-decode
+    # row first: the spec tokens are then the leading num_spec_decode_tokens
+    # tokens and the non-spec tokens follow them.
+    spec_tokens_first: bool = False
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
     uniform_spec_sequence_length: int | None = None  # None for ragged batches
@@ -79,7 +126,12 @@ class GDNAttentionMetadata:
     # Chunk-kernel inputs for prefill
     prefill_query_start_loc: torch.Tensor | None = None
     prefill_state_indices: torch.Tensor | None = None
+    # prefill_state_indices as int64, for index_copy_ into the SSM state.
+    prefill_state_indices_int64: torch.Tensor | None = None
     prefill_has_initial_state: torch.Tensor | None = None
+    # ~prefill_has_initial_state as [num_prefills, 1, 1, 1], to zero the
+    # gathered [num_prefills, HV, V, K] initial states in one masked_fill_.
+    prefill_no_initial_state_mask: torch.Tensor | None = None
     aiter_prefill_metadata: object | None = None
 
     # The following attributes are for triton implementation of causal_conv1d
@@ -116,6 +168,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         ]
         _, self.gdn_prefill_backend = _resolve_gdn_prefill_backend(vllm_config)
         self._check_chunk_metadata_override(type(self), self.gdn_prefill_backend)
+        # Only the Qwen GDN layer opts in on FlashInfer; KDA layers sharing this
+        # backend export checkpoints their own way.
+        checkpoint_alignment = kv_cache_spec.prefill_checkpoint_alignment
+        self.plan_flashinfer_checkpoints = (
+            self.gdn_prefill_backend == "flashinfer"
+            and checkpoint_alignment is not None
+            and checkpoint_alignment % FLASHINFER_GDN_CHECKPOINT_ALIGNMENT == 0
+        )
 
         if self.speculative_config:
             assert self.speculative_config.num_speculative_tokens is not None
@@ -284,6 +344,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
 
         uniform_spec_sequence_length = None
+        spec_tokens_first = False
         spec_sequence_masks_cpu: torch.Tensor | None = None
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
@@ -404,6 +465,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 non_spec_query_start_loc = None
                 non_spec_query_start_loc_cpu = None
             else:
+                spec_tokens_first = bool(
+                    spec_sequence_masks_cpu[:num_spec_decodes].all()
+                )
                 spec_token_masks = torch.repeat_interleave(
                     spec_sequence_masks,
                     query_lens,
@@ -461,7 +525,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         chunk_offsets: torch.Tensor | None = None
         prefill_query_start_loc: torch.Tensor | None = None
         prefill_state_indices: torch.Tensor | None = None
+        prefill_state_indices_int64: torch.Tensor | None = None
         prefill_has_initial_state: torch.Tensor | None = None
+        prefill_no_initial_state_mask: torch.Tensor | None = None
         aiter_prefill_metadata: object | None = None
         if num_prefills > 0:
             # In a mixed non-spec batch, decodes are peeled off to the recurrent
@@ -483,6 +549,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 prefill_query_start_loc = non_spec_query_start_loc
                 prefill_query_start_loc_cpu = non_spec_query_start_loc_cpu
                 prefill_state_indices = non_spec_state_indices_tensor
+            assert prefill_state_indices is not None
+            prefill_state_indices_int64 = prefill_state_indices.to(torch.int64)
 
             if self.gdn_prefill_backend == "aiter_flydsl":
                 # AITER carries its own reusable varlen metadata and has no use
@@ -495,7 +563,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                         cu_seqlens=prefill_query_start_loc,
                     )
                 )
-            else:
+            elif self.gdn_prefill_backend != "flashinfer":
+                # FlashInfer's chunk kernel consumes cu_seqlens directly and
+                # never reads chunk_indices/chunk_offsets, so skip the FLA
+                # metadata (CPU compute + H2D copies) entirely.
                 chunk_indices, chunk_offsets = self._build_chunk_metadata(
                     prefill_query_start_loc,
                     prefill_query_start_loc_cpu,
@@ -518,6 +589,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 prefill_has_initial_state = has_initial_state[num_decodes:]
             else:
                 prefill_has_initial_state = has_initial_state
+            prefill_no_initial_state_mask = ~prefill_has_initial_state.view(-1, 1, 1, 1)
         else:
             has_initial_state = None
 
@@ -527,6 +599,25 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             if spec_sequence_masks_cpu is not None:
                 request_rows = (~spec_sequence_masks_cpu).nonzero().flatten().tolist()
             checkpoint = self.checkpoint_builder.build(m, request_rows)
+
+        flashinfer_checkpoint_plan: GDNFlashInferCheckpointPlan | None = None
+        if checkpoint is not None and self.plan_flashinfer_checkpoints:
+            assert checkpoint.offsets is not None
+            assert checkpoint.query_lens is not None
+            # The prefill kernel runs the trailing checkpoint rows.
+            num_prefill_rows = prefill_query_start_loc_cpu.shape[0] - 1
+            every_n_tokens, cu_starts, rows = plan_flashinfer_checkpoints(
+                checkpoint.offsets, checkpoint.query_lens[-num_prefill_rows:]
+            )
+            plan = async_tensor_h2d(
+                cu_starts + rows, query_start_loc.device, torch.int64
+            )
+            flashinfer_checkpoint_plan = GDNFlashInferCheckpointPlan(
+                every_n_tokens=every_n_tokens,
+                num_checkpoints=cu_starts[-1],
+                cu_starts=plan[: len(cu_starts)],
+                rows=plan[len(cu_starts) :],
+            )
 
         # Function code counted on either presency non-spec decode or spec decode,
         # but not both.
@@ -606,12 +697,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_spec_decode_tokens=num_spec_decode_tokens,
             num_actual_tokens=m.num_actual_tokens,
             checkpoint=checkpoint,
+            flashinfer_checkpoint_plan=flashinfer_checkpoint_plan,
             has_initial_state=has_initial_state,
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
             prefill_query_start_loc=prefill_query_start_loc,
             prefill_state_indices=prefill_state_indices,
+            prefill_state_indices_int64=prefill_state_indices_int64,
             prefill_has_initial_state=prefill_has_initial_state,
+            prefill_no_initial_state_mask=prefill_no_initial_state_mask,
             aiter_prefill_metadata=aiter_prefill_metadata,
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
@@ -621,6 +715,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_sequence_masks_cpu=spec_sequence_masks_cpu,
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
+            spec_tokens_first=spec_tokens_first,
             num_accepted_tokens=num_accepted_tokens,
             uniform_spec_sequence_length=uniform_spec_sequence_length,
             nums_dict=nums_dict,
@@ -711,6 +806,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_state_indices_tensor=spec_indices,
             non_spec_state_indices_tensor=non_spec_indices,
             prefill_state_indices=prefill_indices,
+            prefill_state_indices_int64=(
+                None if prefill_indices is None else prefill_indices.to(torch.int64)
+            ),
             checkpoint=checkpoint,
         )
 
