@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -9,6 +10,7 @@ import pytest
 import torch
 
 import vllm.v1.worker.gpu.model_runner as model_runner_module
+from vllm.config import CacheConfig, ParallelConfig
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
@@ -16,11 +18,13 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.async_utils import async_copy_to_np
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import ExecuteModelState, GPUModelRunner
+from vllm.v1.worker.gpu.spec_decode.standalone_ar import speculator as ar_module
 from vllm.v1.worker.gpu.spec_decode.utils import get_drafter_hidden_states
 
 
@@ -61,16 +65,16 @@ def test_non_last_pp_rank_uses_global_batch_for_sample_feedback():
     runner.pcp_manager.restore_for_sampling.assert_not_called()
 
 
-def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
+def test_initialize_kv_cache_uses_mixed_group_slot_mapping(monkeypatch):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.max_model_len = 262144
     runner.is_encoder_decoder = False
-    runner.dcp_size = 1
+    runner.dcp_size = 2
     runner.dcp_rank = 0
     runner.cp_interleave = 1
     runner.cache_config = SimpleNamespace(enable_prefix_caching=True)
     parallel_config = SimpleNamespace(
-        decode_context_parallel_size=1,
+        decode_context_parallel_size=2,
         cp_kv_cache_interleave_size=1,
     )
     runner.parallel_config = parallel_config
@@ -103,6 +107,27 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
         head_size=128,
         dtype=torch.bfloat16,
     )
+
+    class IndependentSelector(MLAAttentionSpec):
+        @property
+        def has_independent_slot_mapping(self) -> bool:
+            return True
+
+        @property
+        def uses_slot_mapping(self) -> bool:
+            return False
+
+    selector_spec = IndependentSelector(
+        block_size=524288,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        dcp_sharded=False,
+    )
+    mixed_spec = UniformTypeKVCacheSpecs.from_specs(
+        {"selector": selector_spec, "compressed": compressed_spec}, 2
+    )
+    assert mixed_spec is not None
     kv_cache_config = KVCacheConfig(
         num_blocks=1,
         kv_cache_tensors=[],
@@ -114,7 +139,9 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
                     kv_cache_specs={"raw": raw_spec},
                 ),
             ),
-            KVCacheGroupSpec(layer_names=["compressed"], kv_cache_spec=compressed_spec),
+            KVCacheGroupSpec(
+                layer_names=["selector", "compressed"], kv_cache_spec=mixed_spec
+            ),
         ],
     )
 
@@ -366,3 +393,34 @@ def test_async_copy_to_np_does_not_alias_reused_buffer():
     buffer.fill_(1)
 
     assert snapshot.tolist() == [0, 0, 0, 0]
+
+
+@pytest.mark.parametrize(
+    ("draft_dtype", "expected_dtype"),
+    [("auto", "auto"), ("bfloat16", "bfloat16"), (None, "fp8_e4m3")],
+)
+def test_standalone_draft_kv_dtype_override(monkeypatch, draft_dtype, expected_dtype):
+    @dataclass
+    class Config:
+        cache_config: CacheConfig
+        parallel_config: ParallelConfig
+        model_config: object
+        quant_config: object | None = None
+
+    target = Config(CacheConfig(cache_dtype="fp8_e4m3"), ParallelConfig(), object())
+    speculator = object.__new__(ar_module.StandaloneARSpeculator)
+    speculator.vllm_config = target
+    speculator.draft_model_config = object()
+    speculator.speculative_config = SimpleNamespace(
+        kv_cache_dtype=draft_dtype, draft_parallel_config=ParallelConfig()
+    )
+    get_model = Mock(return_value=object())
+    monkeypatch.setattr(ar_module, "get_model", get_model)
+    monkeypatch.setattr(ar_module, "set_model_tag", lambda _: contextlib.nullcontext())
+
+    speculator.load_draft_model(object(), set())
+
+    draft_config = get_model.call_args.kwargs["vllm_config"]
+    assert draft_config.cache_config.cache_dtype == expected_dtype
+    assert speculator.attn_vllm_config.cache_config.cache_dtype == expected_dtype
+    assert target.cache_config.cache_dtype == "fp8_e4m3"

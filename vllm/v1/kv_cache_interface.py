@@ -175,6 +175,10 @@ class KVCacheSpec:
     ``MultipleOf(n)``: whole kernel blocks, when blocks are split into kernel
     blocks of up to ``n`` tokens."""
 
+    is_draft: bool = field(default=False, kw_only=True, compare=False)
+    """Whether a draft model owns this layer; excluded from equality so it never
+    affects grouping."""
+
     def __post_init__(self):
         alignment = self.block_stride_alignment
         if isinstance(alignment, int) and alignment <= 0:
@@ -201,6 +205,11 @@ class KVCacheSpec:
     def prefix_replay_tokens(self) -> int:
         """DeepSeek-V4.1 only: bounded replay. Currently only for DSV41 SWA."""
         return 0
+
+    @property
+    def has_independent_slot_mapping(self) -> bool:
+        """Whether this cache builds its own token-to-slot mapping."""
+        return False
 
     @property
     def num_heads(self) -> int:
@@ -660,6 +669,8 @@ class FullAttentionSpec(AttentionSpec):
         )
         for spec in specs:
             for f in fields(AttentionSpec):
+                if not f.compare:
+                    continue
                 assert getattr(spec, f.name) == getattr(merged_spec, f.name), (
                     "All attention layers in the same KV cache group must have "
                     "the same attention spec."
@@ -747,6 +758,8 @@ class MLAAttentionSpec(FullAttentionSpec):
         )
         for spec in specs:
             for f in fields(AttentionSpec):
+                if not f.compare:
+                    continue
                 assert getattr(spec, f.name) == getattr(merged_spec, f.name), (
                     "All attention layers in the same KV cache group must have "
                     "the same attention spec."
@@ -1208,6 +1221,8 @@ class SinkFullAttentionSpec(FullAttentionSpec):
         )
         for spec in specs:
             for f in fields(AttentionSpec):
+                if not f.compare:
+                    continue
                 assert getattr(spec, f.name) == getattr(merged_spec, f.name), (
                     "All attention layers in the same KV cache group must have "
                     "the same attention spec."
@@ -1234,7 +1249,11 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     def __post_init__(self):
         super().__post_init__()
         if self.kv_cache_specs:
-            object.__setattr__(self, "dcp_sharded", self.first_spec.dcp_sharded)
+            object.__setattr__(
+                self,
+                "dcp_sharded",
+                any(spec.dcp_sharded for spec in self.kv_cache_specs.values()),
+            )
 
     @property
     def prefix_cacheable(self) -> bool:
@@ -1279,28 +1298,58 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         return next(iter(widths))
 
     @classmethod
-    def is_uniform_type(cls, kv_cache_specs: dict[str, KVCacheSpec]) -> bool:
+    def is_uniform_type(
+        cls,
+        kv_cache_specs: dict[str, KVCacheSpec],
+        dcp_world_size: int = 1,
+    ) -> bool:
         """Whether all layers have the same type of KV cache spec.
+
+        Layers can mix sharded and replicated caches if they span the same
+        number of tokens and each replicated cache maps its own slots.
 
         Uses the registry to determine grouping base classes, so custom specs
         that inherit from FullAttentionSpec are treated as full attention.
         """
-        block_sizes = set(spec.block_size for spec in kv_cache_specs.values())
-        if len(block_sizes) > 1:
-            # Different block sizes, not uniform.
+        token_spans = {
+            spec.block_size * (dcp_world_size if spec.dcp_sharded else 1)
+            for spec in kv_cache_specs.values()
+        }
+        if len(token_spans) != 1:
             return False
         if len({spec.dcp_sharded for spec in kv_cache_specs.values()}) > 1:
-            return False
+            if not all(
+                isinstance(spec, FullAttentionSpec) for spec in kv_cache_specs.values()
+            ):
+                return False
+            if not all(
+                spec.dcp_sharded or spec.has_independent_slot_mapping
+                for spec in kv_cache_specs.values()
+            ):
+                return False
+            alignments = {
+                spec.block_table_token_alignment for spec in kv_cache_specs.values()
+            }
+            if len(alignments) != 1:
+                return False
         first_spec = next(iter(kv_cache_specs.values()))
         return first_spec.is_uniform_with_collection(kv_cache_specs)
 
     @classmethod
-    def from_specs(cls, kv_cache_specs: dict[str, KVCacheSpec]) -> Self | None:
+    def from_specs(
+        cls,
+        kv_cache_specs: dict[str, KVCacheSpec],
+        dcp_world_size: int = 1,
+    ) -> Self | None:
         """Return a SameTypeKVCacheSpecs object if all layers have the same type
         of KV cache spec. Return None if not.
         """
-        if cls.is_uniform_type(kv_cache_specs):
-            block_size = next(iter(kv_cache_specs.values())).block_size
+        if cls.is_uniform_type(kv_cache_specs, dcp_world_size):
+            representative = next(
+                (spec for spec in kv_cache_specs.values() if spec.dcp_sharded),
+                next(iter(kv_cache_specs.values())),
+            )
+            block_size = representative.block_size
             return cls(block_size=block_size, kv_cache_specs=kv_cache_specs)
         else:
             return None
@@ -1320,7 +1369,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
 
     @property
     def uses_slot_mapping(self) -> bool:
-        return self.first_spec.uses_slot_mapping
+        return any(spec.uses_slot_mapping for spec in self.kv_cache_specs.values())
 
 
 def iter_layer_specs(kv_cache_spec: KVCacheSpec) -> Collection[KVCacheSpec]:
@@ -1445,7 +1494,7 @@ class KVCacheGroupSpec:
     layer_names: list[str]
     # The KV cache spec of this manager layer
     kv_cache_spec: KVCacheSpec
-    # Whether this group contains EAGLE/MTP draft attention layers.
+    # Whether this group holds draft layers and takes the EAGLE last-block drop.
     is_eagle_group: bool = False
     # Host groups use the dedicated HiSparse pool; others share the device pool.
     host_resident: bool = False
