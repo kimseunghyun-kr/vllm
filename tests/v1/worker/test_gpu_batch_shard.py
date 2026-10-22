@@ -292,25 +292,22 @@ def test_shard_grammar_output(tp_size: int):
     max_num_reqs = 32
     num_reqs = 12
     slots = rng.choice(np.arange(max_num_reqs), size=num_reqs, replace=False)
-    k = rng.integers(0, 4, size=num_reqs)
-    cu = np.zeros(num_reqs + 1, dtype=np.int32)
-    np.cumsum(1 + k, out=cu[1:])
+    mask_stride = 4
     owner = slots % tp_size
 
     # Grammar requests: every other request, in a scrambled order.
     req_ids = [f"req-{i}" for i in range(num_reqs)]
     grammar_idx = list(rng.permutation(np.arange(0, num_reqs, 2)))
     grammar_req_ids = [req_ids[i] for i in grammar_idx]
-    num_grammar_rows = sum(int(cu[i + 1] - cu[i]) for i in grammar_idx)
+    num_grammar_rows = len(grammar_idx) * mask_stride
     bitmask = rng.integers(0, 2**31, size=(num_grammar_rows, 4), dtype=np.int32)
-    input_batch = SimpleNamespace(req_ids=req_ids, cu_num_logits_np=cu)
 
     # Global row offset of each grammar request within the bitmask.
     row_offsets = {}
     cursor = 0
     for i in grammar_idx:
         row_offsets[i] = cursor
-        cursor += int(cu[i + 1] - cu[i])
+        cursor += mask_stride
 
     grammar_output = GrammarOutput(
         structured_output_request_ids=grammar_req_ids,
@@ -320,7 +317,7 @@ def test_shard_grammar_output(tp_size: int):
     kept_total = 0
     for rank in range(tp_size):
         local_req_ids = [req_ids[i] for i in range(num_reqs) if owner[i] == rank]
-        local = _shard_grammar_output(grammar_output, input_batch, local_req_ids)
+        local = _shard_grammar_output(grammar_output, local_req_ids)
         expected_idx = [i for i in grammar_idx if owner[i] == rank]
         if not expected_idx:
             assert local is None
@@ -329,7 +326,7 @@ def test_shard_grammar_output(tp_size: int):
         assert local.structured_output_request_ids == [req_ids[i] for i in expected_idx]
         expected_rows = np.concatenate(
             [
-                np.arange(row_offsets[i], row_offsets[i] + cu[i + 1] - cu[i])
+                np.arange(row_offsets[i], row_offsets[i] + mask_stride)
                 for i in expected_idx
             ]
         )
@@ -617,3 +614,50 @@ def test_finish_requests_frees_slots_in_sorted_order():
     GPUModelRunner.finish_requests(fake_runner, scheduler_output)
     assert removed == sorted(removed)
     assert set(removed) == {"req-a", "req-b", "req-c", "req-d", "req-e"}
+
+
+def test_dummy_sampler_run_profiles_rank_without_local_reqs():
+    """A rank that owns no dummy request must still run its sampler once in
+    the profile run, because it can own a real request later. It must not
+    issue a collective beyond the shared all-to-all."""
+    from vllm.v1.worker.gpu import model_runner
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    tp_size, vocab_size, padded_vocab_size = 2, 10, 16
+    empty_local_batch = SimpleNamespace(num_reqs=0)
+    one_row_batch = SimpleNamespace(num_reqs=1)
+    shard_sampler_inputs = mock.Mock(
+        return_value=(
+            empty_local_batch,
+            torch.zeros(0, dtype=torch.int64),
+            None,
+            SimpleNamespace(),
+        )
+    )
+    fake_runner = SimpleNamespace(
+        input_buffers=object(),
+        batch_sharder=SimpleNamespace(shard_sampler_inputs=shard_sampler_inputs),
+        model=SimpleNamespace(
+            compute_logits_local=lambda h: h.new_zeros(
+                h.shape[0], padded_vocab_size // tp_size
+            )
+        ),
+        vocab_size=vocab_size,
+        sampler=mock.Mock(),
+    )
+    make_dummy = mock.Mock(side_effect=[SimpleNamespace(), one_row_batch])
+    all_to_all_logits = mock.Mock(
+        side_effect=lambda shard, _: shard.new_zeros(0, padded_vocab_size)
+    )
+    with (
+        mock.patch.object(model_runner.InputBatch, "make_dummy", make_dummy),
+        mock.patch.object(model_runner, "all_to_all_logits", all_to_all_logits),
+    ):
+        GPUModelRunner._dummy_sampler_run(fake_runner, torch.randn(3, 4))
+
+    all_to_all_logits.assert_called_once()
+    make_dummy.assert_called_with(1, 1, fake_runner.input_buffers)
+    fake_runner.sampler.assert_called_once()
+    logits, input_batch = fake_runner.sampler.call_args.args
+    assert logits.shape == (1, vocab_size)
+    assert input_batch is one_row_batch
