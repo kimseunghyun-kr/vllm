@@ -197,7 +197,6 @@ def _metadata_launch_pdl() -> bool:
 @triton.jit(
     do_not_specialize=[
         "num_reqs",
-        "num_mapped_tokens",
         "num_tokens",
         "max_num_work",
         "num_search_steps",
@@ -217,7 +216,6 @@ def _build_qsa_metadata_kernel(
     block_table_stride_0: tl.constexpr,
     block_table_stride_1: tl.constexpr,
     num_reqs,
-    num_mapped_tokens,
     num_tokens,
     max_num_work,
     num_search_steps,
@@ -235,6 +233,9 @@ def _build_qsa_metadata_kernel(
         tl.extra.cuda.gdc_wait()
 
     pid = tl.program_id(0)
+    # Read the mapped-token count on device so that a replayed CUDA graph sees
+    # the padding of the replayed batch, not of the captured one.
+    num_mapped_tokens = tl.load(query_start_loc_ptr + num_reqs)
     token_idx = pid * TOKEN_BLOCK_SIZE + tl.arange(0, TOKEN_BLOCK_SIZE)
     store_mask = token_idx < num_tokens
     mapped = token_idx < num_mapped_tokens
@@ -386,65 +387,86 @@ def _build_qsa_metadata_kernel(
             tl.extra.cuda.gdc_launch_dependents()
 
 
+@dataclass(frozen=True)
+class QSAMetadataInputs:
+    """Runner device tensors from which QSA indexer metadata is derived.
+
+    All are persistent runner buffers in a CUDA-graph batch, so metadata built
+    from them can be recomputed in place after the runner advances them.
+    """
+
+    query_start_loc: torch.Tensor  # [num_reqs + 1]
+    seq_lens: torch.Tensor  # [num_reqs]
+    block_table: torch.Tensor  # [num_reqs, max_num_blocks]
+    # Token slots of this cache group; compressed slots stay -1 where it is -1.
+    group_slot_mapping: torch.Tensor  # [>= num_tokens]
+
+    @classmethod
+    def from_common(cls, common: CommonAttentionMetadata) -> "QSAMetadataInputs":
+        return cls(
+            query_start_loc=common.query_start_loc,
+            seq_lens=common.seq_lens,
+            block_table=common.block_table_tensor,
+            group_slot_mapping=common.slot_mapping,
+        )
+
+
 def build_qsa_metadata_triton(
-    common_attn_metadata: CommonAttentionMetadata,
-    token_to_req_buffer: torch.Tensor,
-    logical_positions_buffer: torch.Tensor,
-    visible_blocks_buffer: torch.Tensor,
-    slot_mapping_buffer: torch.Tensor,
+    inputs: QSAMetadataInputs,
+    token_to_req: torch.Tensor,
+    logical_positions: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    slot_mapping: torch.Tensor,
     *,
     storage_block_size: int,
     compress_ratio: int,
     circular_buffer_size: int = 0,
-    k_work_metadata_buffer: torch.Tensor | None = None,
+    k_work_metadata: torch.Tensor | None = None,
     request_capacity: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build QSA indexer cache and optional pre-indexer work metadata."""
-    num_tokens = common_attn_metadata.num_actual_tokens
-    num_mapped_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
-    token_to_req = token_to_req_buffer[:num_tokens]
-    logical_positions = logical_positions_buffer[:num_tokens]
-    visible_blocks = visible_blocks_buffer[:num_tokens]
-    slot_mapping = slot_mapping_buffer[:num_tokens]
-    num_reqs = common_attn_metadata.query_start_loc.shape[0] - 1
+    """Write QSA indexer cache and optional pre-indexer work metadata in place.
+
+    The four token outputs are ``[num_tokens]`` views. Only device tensors and
+    fixed shapes are read, so the launch is safe to record in a CUDA graph.
+    """
+    num_tokens = token_to_req.shape[0]
+    query_start_loc = inputs.query_start_loc
+    num_reqs = query_start_loc.shape[0] - 1
     assert num_reqs > 0
 
-    if k_work_metadata_buffer is not None:
+    if k_work_metadata is not None:
         if request_capacity is None:
             request_capacity = num_reqs
         assert request_capacity >= num_reqs
         # Pad for tl.arange while keeping the scan width stable across live batches.
         request_scan_size = 1 << int(math.ceil(math.log2(request_capacity)))
-        max_num_work = k_work_metadata_buffer.shape[0]
+        max_num_work = k_work_metadata.shape[0]
     else:
         request_scan_size = 1
         max_num_work = 0
 
-    if num_tokens == 0 and k_work_metadata_buffer is None:
+    if num_tokens == 0 and k_work_metadata is None:
         return token_to_req, logical_positions, visible_blocks, slot_mapping
 
-    block_table = common_attn_metadata.block_table_tensor
+    block_table = inputs.block_table
     num_search_steps = int(math.ceil(math.log2(num_reqs)))
     work_search_steps = int(math.ceil(math.log2(num_reqs)))
     # The same grid covers token tiles and, for the compressed cache, work tiles.
     num_token_blocks = cdiv(num_tokens, 128)
-    num_work_blocks = (
-        cdiv(max_num_work, 256) if k_work_metadata_buffer is not None else 0
-    )
+    num_work_blocks = cdiv(max_num_work, 256) if k_work_metadata is not None else 0
     _build_qsa_metadata_kernel[(max(num_token_blocks, num_work_blocks, 1),)](
-        common_attn_metadata.query_start_loc,
-        common_attn_metadata.seq_lens,
-        common_attn_metadata.slot_mapping,
+        query_start_loc,
+        inputs.seq_lens,
+        inputs.group_slot_mapping,
         block_table,
         token_to_req,
         logical_positions,
         visible_blocks,
         slot_mapping,
-        k_work_metadata_buffer,
+        k_work_metadata,
         block_table.stride(0),
         block_table.stride(1),
         num_reqs,
-        num_mapped_tokens,
         num_tokens,
         max_num_work,
         num_search_steps,
@@ -460,43 +482,43 @@ def build_qsa_metadata_triton(
         num_warps=4,
     )
     if circular_buffer_size == 0 and compress_ratio == 1:
-        slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
+        slot_mapping = inputs.group_slot_mapping[:num_tokens]
     return token_to_req, logical_positions, visible_blocks, slot_mapping
 
 
 def _build_qsa_metadata_torch(
-    common_attn_metadata: CommonAttentionMetadata,
-    token_to_req_buffer: torch.Tensor,
-    logical_positions_buffer: torch.Tensor,
-    visible_blocks_buffer: torch.Tensor,
-    slot_mapping_buffer: torch.Tensor,
+    inputs: QSAMetadataInputs,
+    token_to_req: torch.Tensor,
+    logical_positions: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    slot_mapping: torch.Tensor,
     *,
     storage_block_size: int,
     compress_ratio: int,
     circular_buffer_size: int = 0,
-    k_work_metadata_buffer: torch.Tensor | None = None,
+    k_work_metadata: torch.Tensor | None = None,
     request_capacity: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     del request_capacity
-    num_tokens = common_attn_metadata.num_actual_tokens
-    num_mapped_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
-    logical_positions = logical_positions_buffer[:num_tokens]
-    visible_blocks = visible_blocks_buffer[:num_tokens]
-
-    token_to_req = common_attn_metadata.token_to_req_indices(token_to_req_buffer)[
-        :num_tokens
-    ]
-    logical_positions[:num_mapped_tokens].copy_(
-        _logical_positions(
-            common_attn_metadata.query_start_loc,
-            common_attn_metadata.seq_lens,
-            token_to_req[:num_mapped_tokens],
-            num_mapped_tokens,
+    num_tokens = token_to_req.shape[0]
+    query_start_loc = inputs.query_start_loc
+    seq_lens = inputs.seq_lens
+    num_reqs = query_start_loc.shape[0] - 1
+    # Like the Triton kernel, derive the mapped tokens from device tensors only.
+    rows = torch.arange(num_tokens, device=query_start_loc.device)
+    mapped = rows < query_start_loc[-1]
+    owners = torch.searchsorted(
+        query_start_loc[1:], rows.to(query_start_loc.dtype), right=True
+    ).clamp_max_(num_reqs - 1)
+    token_to_req.copy_(torch.where(mapped, owners, 0))
+    logical_positions.copy_(
+        torch.where(
+            mapped,
+            _logical_positions(query_start_loc, seq_lens, token_to_req, num_tokens),
+            -1,
         )
     )
-    if num_mapped_tokens < num_tokens:
-        logical_positions[num_mapped_tokens:].fill_(-1)
-    row_seq_lens = common_attn_metadata.seq_lens.index_select(0, token_to_req.long())
+    row_seq_lens = seq_lens.index_select(0, token_to_req.long())
     visible_blocks.copy_(
         torch.minimum(
             (logical_positions + 1) // compress_ratio,
@@ -507,36 +529,30 @@ def _build_qsa_metadata_torch(
     )
     if circular_buffer_size > 0:
         slot_mapping = circular_qsa_slot_mapping(
-            common_attn_metadata.block_table_tensor,
+            inputs.block_table,
             token_to_req,
             logical_positions,
             circular_buffer_size,
-            query_start_loc=common_attn_metadata.query_start_loc,
-            out=slot_mapping_buffer,
+            query_start_loc=query_start_loc,
+            out=slot_mapping,
         )
     elif compress_ratio == 1:
-        slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
+        slot_mapping = inputs.group_slot_mapping[:num_tokens]
     else:
         slot_mapping = compressed_qsa_slot_mapping(
-            common_attn_metadata.block_table_tensor,
+            inputs.block_table,
             token_to_req,
             logical_positions,
             storage_block_size,
             compress_ratio,
-            slot_mapping_buffer,
+            slot_mapping,
         )
-        slot_mapping.masked_fill_(
-            common_attn_metadata.slot_mapping[:num_tokens] < 0, -1
-        )
-    if k_work_metadata_buffer is not None:
-        query_lens = (
-            common_attn_metadata.query_start_loc[1:]
-            - common_attn_metadata.query_start_loc[:-1]
-        )
-        chunk_starts = common_attn_metadata.seq_lens - query_lens
+        slot_mapping.masked_fill_(inputs.group_slot_mapping[:num_tokens] < 0, -1)
+    if k_work_metadata is not None:
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        chunk_starts = seq_lens - query_lens
         num_work_per_request = (
-            common_attn_metadata.seq_lens // compress_ratio
-            - chunk_starts // compress_ratio
+            seq_lens // compress_ratio - chunk_starts // compress_ratio
         )
         num_work_per_request = torch.where(
             query_lens > 0, num_work_per_request.clamp_min(1), 0
@@ -549,18 +565,16 @@ def _build_qsa_metadata_torch(
         k_start_loc[0] = 0
         torch.cumsum(num_work_per_request, 0, out=k_start_loc[1:])
         work = torch.arange(
-            k_work_metadata_buffer.shape[0],
-            device=k_work_metadata_buffer.device,
+            k_work_metadata.shape[0],
+            device=k_work_metadata.device,
         )
         requests = torch.searchsorted(k_start_loc[1:], work, right=True)
         active = work < k_start_loc[-1]
         work_in_request = (
             work - k_start_loc[requests.clamp_max(query_lens.shape[0] - 1)]
         )
-        k_work_metadata_buffer[:, 0].copy_(
-            torch.where(active, requests, -1).to(torch.int32)
-        )
-        k_work_metadata_buffer[:, 1].copy_(
+        k_work_metadata[:, 0].copy_(torch.where(active, requests, -1).to(torch.int32))
+        k_work_metadata[:, 1].copy_(
             torch.where(active, work_in_request, -1).to(torch.int32)
         )
     return token_to_req, logical_positions, visible_blocks, slot_mapping
@@ -580,6 +594,8 @@ class QSAIndexerMetadata(AttentionMetadata):
     slot_mapping: torch.Tensor
     seq_lens: torch.Tensor
     query_start_loc: torch.Tensor
+    # The cache group's token slots that ``slot_mapping`` was derived from.
+    group_slot_mapping: torch.Tensor
     token_to_req: torch.Tensor
     # Positions in the original uncompressed sequence, padded with -1.
     logical_positions: torch.Tensor  # [num_tokens]
@@ -606,6 +622,7 @@ class QSAIndexerMetadataBuilder(AttentionMetadataBuilder[QSAIndexerMetadata]):
     """Build QSA metadata from vLLM's cache-group-specific common metadata."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    supports_draft_decode_metadata_update = True
 
     def __init__(
         self,
@@ -682,37 +699,23 @@ class QSAIndexerMetadataBuilder(AttentionMetadataBuilder[QSAIndexerMetadata]):
             if nonzero_query_lens.numel() > 0:
                 decode_query_len = int(nonzero_query_lens[0].item())
                 assert torch.all(nonzero_query_lens == decode_query_len)
-        build_k_work = not self.is_circular_buffer and self.compress_ratio != 1
         k_work_metadata = self.k_work_metadata_buffer
-        request_capacity = None
-        if build_k_work:
+        if self._builds_k_work:
             num_requests = common_attn_metadata.query_start_loc.shape[0] - 1
-            request_capacity = self.request_capacity
             max_num_work = (
                 num_tokens + (self.compress_ratio - 1) * num_requests
             ) // self.compress_ratio
             k_work_metadata = self.k_work_metadata_buffer[:max_num_work]
+        inputs = QSAMetadataInputs.from_common(common_attn_metadata)
         token_to_req, logical_positions, visible_blocks, slot_mapping = (
-            build_qsa_metadata(
-                common_attn_metadata,
-                self.token_to_req_buffer,
-                self.logical_positions_buffer,
-                self.visible_blocks_buffer,
-                self.slot_mapping_buffer,
-                storage_block_size=self.storage_block_size,
-                compress_ratio=self.compress_ratio,
-                circular_buffer_size=(
-                    self.kv_cache_spec.block_size if self.is_circular_buffer else 0
-                ),
-                k_work_metadata_buffer=k_work_metadata if build_k_work else None,
-                request_capacity=request_capacity,
-            )
+            self._write_metadata(inputs, num_tokens, k_work_metadata)
         )
         return QSAIndexerMetadata(
-            block_table=common_attn_metadata.block_table_tensor,
+            block_table=inputs.block_table,
             slot_mapping=slot_mapping,
-            seq_lens=common_attn_metadata.seq_lens,
-            query_start_loc=common_attn_metadata.query_start_loc,
+            seq_lens=inputs.seq_lens,
+            query_start_loc=inputs.query_start_loc,
+            group_slot_mapping=inputs.group_slot_mapping,
             token_to_req=token_to_req,
             logical_positions=logical_positions,
             visible_blocks=visible_blocks,
@@ -727,6 +730,57 @@ class QSAIndexerMetadataBuilder(AttentionMetadataBuilder[QSAIndexerMetadata]):
             max_seq_len=common_attn_metadata.max_seq_len,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+        )
+
+    def update_draft_decode_metadata(self, metadata: QSAIndexerMetadata) -> None:
+        """Recompute the token metadata of a draft decode step in place.
+
+        Before the call, the runner has advanced ``seq_lens`` and rewritten the
+        group slot mappings in their persistent buffers; ``query_start_loc``
+        and the block table keep their addresses and fixed shapes. This repeats
+        the device part of :meth:`build` on the tensors that ``metadata``
+        already references, so the result equals a fresh build of the step.
+
+        The host integers stay valid: draft decode batches are uniform, with
+        zero-length padding requests counted as decodes, so the split and
+        ``decode_query_len`` do not change. ``max_seq_len`` is the drafter's
+        static bound and only the prefill selection path reads it.
+        """
+        inputs = QSAMetadataInputs(
+            query_start_loc=metadata.query_start_loc,
+            seq_lens=metadata.seq_lens,
+            block_table=metadata.block_table,
+            group_slot_mapping=metadata.group_slot_mapping,
+        )
+        self._write_metadata(
+            inputs, metadata.num_actual_tokens, metadata.k_work_metadata
+        )
+
+    @property
+    def _builds_k_work(self) -> bool:
+        return not self.is_circular_buffer and self.compress_ratio != 1
+
+    def _write_metadata(
+        self,
+        inputs: QSAMetadataInputs,
+        num_tokens: int,
+        k_work_metadata: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Write token metadata into this builder's persistent buffers."""
+        builds_k_work = self._builds_k_work
+        return build_qsa_metadata(
+            inputs,
+            self.token_to_req_buffer[:num_tokens],
+            self.logical_positions_buffer[:num_tokens],
+            self.visible_blocks_buffer[:num_tokens],
+            self.slot_mapping_buffer[:num_tokens],
+            storage_block_size=self.storage_block_size,
+            compress_ratio=self.compress_ratio,
+            circular_buffer_size=(
+                self.kv_cache_spec.block_size if self.is_circular_buffer else 0
+            ),
+            k_work_metadata=k_work_metadata if builds_k_work else None,
+            request_capacity=self.request_capacity if builds_k_work else None,
         )
 
 
@@ -883,6 +937,7 @@ class QSACompressedKeyCache(_QSAIndexerCache):
 __all__ = [
     "QSACompressedKeyCache",
     "QSAIndexerMetadata",
+    "QSAMetadataInputs",
     "QSARawKeyCache",
     "QSAIndexerMetadataBuilder",
     "QSAIndexerBackend",
