@@ -478,8 +478,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         cudagraph_mode: CUDAGraphMode | None = None,
     ) -> GDNAttentionMetadata:
         """``cudagraph_mode`` is the batch's runtime mode, if the caller knows
-        it. Only a PIECEWISE forward reads the capture buffers, so a batch that
-        runs FULL or eager skips staging them."""
+        it. A FULL replay never reads the capture buffers, so a FULL batch
+        skips staging them. PIECEWISE capture builds its metadata with mode
+        NONE, so NONE still stages."""
         m = common_attn_metadata
 
         query_start_loc = m.query_start_loc
@@ -860,7 +861,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
         if self.captures_mixed_batches:
-            if cudagraph_mode in (None, CUDAGraphMode.PIECEWISE):
+            if cudagraph_mode != CUDAGraphMode.FULL:
                 attn_metadata = self._stage_capture_buffers(
                     attn_metadata, m, non_spec_query_start_loc_cpu
                 )
@@ -1100,7 +1101,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             checkpoint=checkpoint,
         )
         if self.captures_mixed_batches:
-            # build() staged no capture buffers for a FULL or eager batch.
+            # build() staged no capture buffers for a FULL batch.
             if m.capture_buffers is not None:
                 values = self._capture_values(metadata)
                 metadata = self._stage_capture_fields(
