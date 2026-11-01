@@ -840,13 +840,13 @@ def test_capture_buffers_hold_any_batch(update_block_table: bool, mamba_cache_mo
         (None, True),
         (CUDAGraphMode.PIECEWISE, True),
         (CUDAGraphMode.FULL, False),
-        (CUDAGraphMode.NONE, False),
+        (CUDAGraphMode.NONE, True),
     ],
 )
-def test_capture_buffers_staged_only_for_piecewise(cudagraph_mode, staged):
-    """Only a PIECEWISE forward reads the capture buffers: a FULL or eager
-    batch leaves them untouched, in build() and in update_block_table(), and
-    keeps the batch's own metadata. An unknown mode stages as before."""
+def test_capture_buffers_skipped_for_full(cudagraph_mode, staged):
+    """A FULL batch leaves the capture buffers untouched, in build() and in
+    update_block_table(), and keeps the batch's own metadata. NONE must still
+    stage: PIECEWISE capture builds its metadata with mode NONE."""
     from vllm.v1.attention.backends.gdn_attn import (
         CAPTURE_PAD_VALUES,
         STATE_INDEX_FIELDS,
