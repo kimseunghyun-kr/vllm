@@ -321,7 +321,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # boundary, MRV2 moves the state between blocks before the forward,
         # and the forward reads only the block-aligned state indices.
         self.captures_mixed_batches = (
-            is_breakable_cudagraph_enabled()
+            is_breakable_cudagraph_enabled(self.compilation_config)
             and self.compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
             and vllm_config.use_v2_model_runner
             and current_platform.is_cuda()
