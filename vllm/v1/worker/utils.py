@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from itertools import product as iprod
 from typing import Any
@@ -35,6 +35,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheLayout,
     KVCacheSpec,
+    KVCacheTensor,
     MambaSpec,
     UniformTypeKVCacheSpecs,
     create_kv_cache_views,
@@ -258,12 +259,30 @@ class KVBlockZeroer:
             self.zero_block_ids([0])
 
 
+def packed_kernel_blocks_are_mappable(
+    spec: KVCacheSpec, kernel_block_size: int, block_stride_bytes: int
+) -> bool:
+    """Whether packed manager blocks can be viewed as kernel blocks."""
+    kernel_rows = spec.get_num_kernel_states(kernel_block_size)
+    return (
+        spec.tokens_per_state > 1
+        and spec.num_heads == 1
+        and spec.block_size % kernel_block_size == 0
+        and kernel_rows > 0
+        # Every manager state must belong to a kernel page.
+        and spec.num_states == (spec.block_size // kernel_block_size) * kernel_rows
+        and block_stride_bytes % (kernel_rows * spec.state_content_size_bytes) == 0
+    )
+
+
 @dataclass(eq=False)
 class AttentionGroup:
     backend: type[AttentionBackend]
     layer_names: list[str]
     kv_cache_spec: KVCacheSpec
     kv_cache_group_id: int
+    # Row width the runner allocated for this group's block table, in manager blocks.
+    block_table_width: int | None = None
     # Set when the backend needs blocks smaller than the KV cache manager's: its
     # block tables and KV cache views then address kernel blocks, kernel block j
     # of block b being b * kernel_block_stride + j. The stride is set when a
@@ -306,10 +325,15 @@ class AttentionGroup:
         builder_cls = self.backend.get_builder_cls()
         builder_kwargs = {}
         if builder_cls.requires_block_table_width or self.kernel_block_size is not None:
-            max_num_blocks = self.kv_cache_spec.max_num_blocks_per_req(
-                vllm_config, vllm_config.model_config.max_model_len
-            )
-            width = get_block_table_width(max_num_blocks, self.kv_cache_spec.block_size)
+            width = self.block_table_width
+            if width is None:
+                # Groups built outside init_attn_backend have no runner width.
+                max_num_blocks = self.kv_cache_spec.max_num_blocks_per_req(
+                    vllm_config, vllm_config.model_config.max_model_len
+                )
+                width = get_block_table_width(
+                    max_num_blocks, self.kv_cache_spec.block_size
+                )
             if kernel_block_size is not None:
                 width *= self.kv_cache_spec.block_size // kernel_block_size
             if builder_cls.requires_block_table_width:
@@ -386,6 +410,11 @@ class AttentionGroup:
         blocks_per_kv_block = self.kv_cache_spec.block_size // self.kernel_block_size
         rows, cols = block_table.shape
         out = self.kernel_block_table[ubatch_idx, :rows, : cols * blocks_per_kv_block]
+        if out.shape[1] != cols * blocks_per_kv_block:
+            raise ValueError(
+                f"kernel block table row has {out.shape[1]} columns, "
+                f"needs {cols} x {blocks_per_kv_block}"
+            )
         torch.add(
             self.kernel_block_offsets,
             block_table.unsqueeze(-1),
@@ -401,13 +430,10 @@ class AttentionGroup:
         kernel_rows = spec.get_num_kernel_states(self.kernel_block_size)
         if kv_cache.shape[-2] == kernel_rows:
             return kv_cache
-        # Token and pooled caches are written through manager-block slot
-        # mappings, so only compressed caches (written from their block table)
-        # can be mapped.
-        if (
-            spec.tokens_per_state <= 1
-            or kv_cache.shape[1] != 1
-            or kv_cache.stride(0) % (kernel_rows * kv_cache.stride(-2))
+        # Only compressed caches written from their block table can use
+        # virtual kernel pages.
+        if not packed_kernel_blocks_are_mappable(
+            spec, self.kernel_block_size, kv_cache.stride(0) * kv_cache.element_size()
         ):
             raise ValueError(
                 f"{self.backend.get_name()} needs {self.kernel_block_size}-token "
@@ -420,6 +446,8 @@ class AttentionGroup:
         # spans the other layers' pages between blocks (never addressing them),
         # which ``view`` cannot express.
         page_stride = kernel_rows * kv_cache.stride(-2)
+        if page_stride <= 0 or kv_cache.stride(0) % page_stride:
+            raise ValueError("Packed KV blocks must contain whole kernel pages")
         self.kernel_block_stride = kv_cache.stride(0) // page_stride
         num_pages = (kv_cache.shape[0] - 1) * self.kernel_block_stride + (
             kv_cache.shape[-2] // kernel_rows
@@ -566,12 +594,16 @@ def allocate_kv_cache(
     device: torch.device,
     layout: KVCacheLayout,
     kernel_block_sizes: list[int] | None = None,
+    allocate: Callable[[int], torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Allocate the KV cache and view it as ``[B, H, N, C]`` per layer.
 
     Every KVCacheTensor places its layers in the same backing allocation: layer ``l`` of
     block ``b`` starts at ``offset + l * layer_stride + b * block_stride``. Cache
     groups overlay each other, so tensors may address the same bytes.
+
+    allocate replaces the default zeroed backing allocation: it takes the
+    size in bytes and returns a one-byte-per-element tensor.
     """
     if not kv_cache_config.kv_cache_tensors:
         return {}
@@ -579,6 +611,83 @@ def allocate_kv_cache(
     sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
     assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
     raw_size = sizes.pop()
+    if allocate is not None:
+        buf = allocate(raw_size)
+    else:
+        buf = _allocate_kv_cache_buffer(raw_size, device)
+
+    kv_caches: dict[str, torch.Tensor] = {}
+    for tensor in kv_cache_config.kv_cache_tensors:
+        group_id, spec = layer_spec_for_tensor(kv_cache_config, tensor)
+        if not spec.has_layer_views:
+            kv_caches.update((name, buf) for name in tensor.layers)
+            continue
+
+        kernel_block_size = view_kernel_block_size(
+            spec, tensor, layer_kernel_block_size(group_id, kernel_block_sizes)
+        )
+        views = create_kv_cache_views(
+            buf,
+            spec,
+            kv_cache_config.num_blocks_of(tensor),
+            layout,
+            tensor,
+            kernel_block_size=kernel_block_size,
+        )
+        kv_caches.update(zip(tensor.layers, views))
+    return kv_caches
+
+
+def layer_spec_for_tensor(
+    kv_cache_config: KVCacheConfig, tensor: KVCacheTensor
+) -> tuple[int, KVCacheSpec]:
+    """Cache group index and per-layer spec of the layers tensor places."""
+    layer_name = tensor.layers[0]
+    group_id, group = next(
+        (group_id, group)
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+        if layer_name in group.layer_names
+    )
+    spec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        spec = spec.kv_cache_specs[layer_name]
+    return group_id, spec
+
+
+def layer_kernel_block_size(
+    group_id: int, kernel_block_sizes: list[int] | None
+) -> int | None:
+    """Kernel block size to view the group's pages with, if it differs."""
+    kernel_block_size = None
+    if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
+        kernel_block_size = kernel_block_sizes[group_id]
+    return kernel_block_size
+
+
+def view_kernel_block_size(
+    spec: KVCacheSpec, tensor: KVCacheTensor, kernel_block_size: int | None
+) -> int | None:
+    """Kernel block size to create the layer's views with.
+
+    None binds a packed compressed page whole; AttentionGroup maps its kernel
+    blocks afterwards, with the stride between manager blocks.
+    """
+    if (
+        kernel_block_size is not None
+        and isinstance(spec, AttentionSpec)
+        and spec.page_size_padded is None
+        and spec.block_size > kernel_block_size
+        and spec.block_size % kernel_block_size == 0
+        and tensor.block_stride > spec.unpadded_page_size_bytes
+        and packed_kernel_blocks_are_mappable(
+            spec, kernel_block_size, tensor.block_stride
+        )
+    ):
+        return None
+    return kernel_block_size
+
+
+def _allocate_kv_cache_buffer(raw_size: int, device: torch.device) -> torch.Tensor:
     # wvSplitKrc's process-lifetime static workspaces (csrc/rocm/skinny_gemms.cu)
     # are created lazily on the first qualifying GEMM. Force that now, before
     # the giant backing allocation below: if one landed in this segment's
@@ -593,38 +702,7 @@ def allocate_kv_cache(
         buf_size = ((raw_size + page_size - 1) // page_size) * page_size
     else:
         buf_size = raw_size
-    buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
-
-    kv_caches: dict[str, torch.Tensor] = {}
-    for tensor in kv_cache_config.kv_cache_tensors:
-        layer_name = tensor.layers[0]
-        group_id, group = next(
-            (group_id, group)
-            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
-            if layer_name in group.layer_names
-        )
-        spec = group.kv_cache_spec
-        if isinstance(spec, UniformTypeKVCacheSpecs):
-            spec = spec.kv_cache_specs[layer_name]
-
-        if not spec.has_layer_views:
-            kv_caches.update((name, buf) for name in tensor.layers)
-            continue
-
-        num_blocks = kv_cache_config.num_blocks_of(tensor)
-        kernel_block_size = None
-        if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
-            kernel_block_size = kernel_block_sizes[group_id]
-        views = create_kv_cache_views(
-            buf,
-            spec,
-            num_blocks,
-            layout,
-            tensor,
-            kernel_block_size=kernel_block_size,
-        )
-        kv_caches.update(zip(tensor.layers, views))
-    return kv_caches
+    return torch.zeros(buf_size, dtype=torch.int8, device=device)
 
 
 def prepare_kernel_block_sizes(
@@ -721,9 +799,8 @@ def request_memory(
     """Calculate the amount of memory required by vLLM, then validate
     that the current amount of free memory is sufficient for that.
     """
-    requested_memory = math.ceil(
-        init_snapshot.total_memory * cache_config.gpu_memory_utilization
-    )
+    gpu_memory_utilization = cache_config.resolved_gpu_memory_utilization
+    requested_memory = math.ceil(init_snapshot.total_memory * gpu_memory_utilization)
 
     if external_weight_memory > 0:
         engine_memory = requested_memory - external_weight_memory
@@ -733,18 +810,23 @@ def request_memory(
                 f"({format_gib(external_weight_memory)}/"
                 f"{format_gib(init_snapshot.total_memory)} GiB) exceed the "
                 "desired GPU memory utilization "
-                f"({cache_config.gpu_memory_utilization}, "
+                f"({gpu_memory_utilization}, "
                 f"{format_gib(requested_memory)} GiB). Increase GPU memory "
                 "utilization or reduce GPU memory used by other processes."
             )
-        if init_snapshot.free_memory < engine_memory:
+        # With the extensible KV cache the budget is only a cap; exceeding free
+        # memory over-reserves address space rather than pages.
+        if (
+            init_snapshot.free_memory < engine_memory
+            and not cache_config.enable_extensible_kv_cache
+        ):
             raise ValueError(
                 f"Free memory on device {init_snapshot.device_} "
                 f"({format_gib(init_snapshot.free_memory)}/"
                 f"{format_gib(init_snapshot.total_memory)} GiB) on startup "
                 "is less than the engine's budget after excluding "
                 "external process's weights "
-                f"({cache_config.gpu_memory_utilization}, "
+                f"({gpu_memory_utilization}, "
                 f"{format_gib(engine_memory)} GiB). Decrease GPU memory "
                 "utilization or reduce GPU memory used by other processes."
             )
@@ -758,13 +840,18 @@ def request_memory(
         )
         return engine_memory
 
-    if init_snapshot.free_memory < requested_memory:
+    if (
+        init_snapshot.free_memory < requested_memory
+        and not cache_config.enable_extensible_kv_cache
+    ):
+        # With the extensible KV cache the budget is only a cap; exceeding free
+        # memory over-reserves address space rather than pages.
         raise ValueError(
             f"Free memory on device {init_snapshot.device_} "
             f"({format_gib(init_snapshot.free_memory)}/"
             f"{format_gib(init_snapshot.total_memory)} GiB) on startup "
             f"is less than desired GPU memory utilization "
-            f"({cache_config.gpu_memory_utilization}, "
+            f"({gpu_memory_utilization}, "
             f"{format_gib(requested_memory)} GiB). Decrease GPU memory "
             f"utilization or reduce GPU memory used by other processes."
         )
@@ -916,12 +1003,22 @@ def copy_kv_cache_blocks_inplace(
 
     indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
     indices: torch.Tensor | None = None
-    seen: set[tuple[torch.device, int]] = set()
+    seen: set[tuple[Any, ...]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()
     for cache in kv_caches:
         # Layers sharing KV (cross-layer sharing) alias the same view; copy it
-        # once. data_ptr distinguishes per-layer views of a shared allocation.
-        key = (cache.device, cache.data_ptr())
+        # once. Hybrid models overlay layers of different kinds on one tensor,
+        # so views at the same address can differ in geometry (a Mamba state
+        # view spans only the leading bytes of a block that an attention view
+        # spans in full); each geometry must be copied, so the key covers the
+        # view's shape and strides and not just its address.
+        key = (
+            cache.device,
+            cache.data_ptr(),
+            tuple(cache.shape),
+            tuple(cache.stride()),
+            cache.element_size(),
+        )
         if key in seen:
             continue
         seen.add(key)
