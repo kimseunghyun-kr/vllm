@@ -57,6 +57,12 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
+    gather_initial_states,
+)
+from vllm.model_executor.layers.mamba.ops.scatter_states import (
+    scatter_states,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
@@ -1955,8 +1961,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 )
                 prefill_in_place = prefill_out is not None
             else:
-                initial_state = ssm_state[prefill_state_indices]
-                initial_state[~prefill_has_initial_state, ...] = 0
+                initial_state = gather_initial_states(
+                    ssm_state, prefill_state_indices, prefill_has_initial_state
+                )
                 (
                     core_attn_out_non_spec,
                     last_recurrent_state,
@@ -1975,7 +1982,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     aiter_prefill_metadata=attn_metadata.aiter_prefill_metadata,
                 )
             # Init cache
-            ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+            scatter_states(ssm_state, last_recurrent_state, prefill_state_indices)
 
             if split_non_spec and prefill_in_place:
                 core_attn_out[:num_decode_tokens] = core_attn_out_decode.squeeze(0)
@@ -2040,9 +2047,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         rows' final states.
         """
         has_initial_state = attn_metadata.prefill_has_initial_state
+        state_indices = attn_metadata.prefill_state_indices
         assert has_initial_state is not None
-        initial_state = ssm_state[attn_metadata.prefill_state_indices]
-        initial_state[~has_initial_state, ...] = 0
+        assert state_indices is not None
+        initial_state = gather_initial_states(
+            ssm_state, state_indices, has_initial_state
+        )
         plan = attn_metadata.flashinfer_checkpoint_plan
         if plan is None:
             return fi_chunk_gated_delta_rule(
