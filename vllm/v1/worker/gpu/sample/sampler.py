@@ -9,6 +9,8 @@ import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
+from vllm.distributed import tensor_model_parallel_all_gather
+from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p,
@@ -20,6 +22,14 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
 from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+from vllm.v1.worker.gpu.sample.candidates import (
+    MAX_CANDIDATE_TOP_K,
+    NUM_SHARD_CANDIDATES,
+    finalize_candidates,
+    gumbel_sample_candidates,
+    merge_shard_candidates,
+    top_k_shard_candidates,
+)
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.logits_processor.interface import (
@@ -83,6 +93,10 @@ class Sampler:
             TraceReplayState(req_states) if enable_trace_replay else None
         )
         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
+        # Whether a request's token depends only on its top-k processed logits,
+        # through processing that `process_shard` supports.
+        self.candidate_eligible = np.zeros(max_num_reqs, dtype=bool)
+        self.has_custom_logits_processors = bool(custom_logits_processors)
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
@@ -102,9 +116,120 @@ class Sampler:
             needs_processing |= processor.add_request(req_idx, sampling_params)
         self.needs_logits_processing[req_idx] = needs_processing
 
+        self.candidate_eligible[req_idx] = self._is_candidate_eligible(sampling_params)
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         if self.trace_replay_state is not None:
             self.trace_replay_state.add_request(req_idx, sampling_params)
+
+    def _is_candidate_eligible(self, sampling_params: SamplingParams) -> bool:
+        top_k = sampling_params.top_k
+        return bool(
+            (sampling_params.temperature == 0.0 or 0 < top_k <= MAX_CANDIDATE_TOP_K)
+            and sampling_params.min_p == 0.0
+            and sampling_params.logprobs is None
+            and not sampling_params.logprob_token_ids
+            and not sampling_params.logit_bias
+            and not sampling_params.allowed_token_ids
+            and not sampling_params.bad_words_token_ids
+            and sampling_params.thinking_token_budget is None
+            and not self.has_custom_logits_processors
+        )
+
+    def supports_candidates(self, idx_mapping_np: np.ndarray) -> bool:
+        """Whether this step can be sampled from per-shard top-k candidates."""
+        return (
+            not self.compute_nans
+            and not self.return_sampling_mask
+            and self.trace_replay_state is None
+            and bool(np.all(self.candidate_eligible[idx_mapping_np]))
+        )
+
+    def shard_candidates(
+        self,
+        shard_logits: torch.Tensor,  # [num_logits, shard_width]
+        vocab_start: int,
+        expanded_idx_mapping: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray,
+        pos: torch.Tensor,
+        input_ids: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+        seq_lens_upper_bound_np: np.ndarray,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Process this rank's vocabulary shard of the logits and reduce the
+        ranks' shards to the kept candidates of each row.
+
+        The result equals the kept entries of `apply_sampling_params` on the
+        gathered logits, in the layout of `sample.candidates`.
+        """
+        logits = torch.empty_like(shard_logits, dtype=torch.float32).copy_(shard_logits)
+        ctx = LogitsContext(
+            expanded_idx_mapping=expanded_idx_mapping,
+            idx_mapping=idx_mapping,
+            idx_mapping_np=idx_mapping_np,
+            expanded_local_pos=expanded_local_pos,
+            input_ids=input_ids,
+            pos=pos,
+            seq_lens_upper_bound_np=seq_lens_upper_bound_np,
+        )
+        self.penalties_state.apply_to_shard(logits, ctx, vocab_start)
+        self.sampling_states.apply_temperature(
+            logits, expanded_idx_mapping, idx_mapping_np
+        )
+        packed = top_k_shard_candidates(logits, vocab_start, NUM_SHARD_CANDIDATES)
+        gathered = tensor_model_parallel_all_gather(packed, dim=-1)
+        values, token_ids = merge_shard_candidates(
+            gathered, get_tensor_model_parallel_world_size()
+        )
+        return finalize_candidates(
+            values,
+            token_ids,
+            expanded_idx_mapping,
+            self.sampling_states.top_k.gpu,
+            self.sampling_states.top_p.gpu,
+        )
+
+    def sample_candidates(
+        self, shard_logits: torch.Tensor, vocab_start: int, input_batch: InputBatch
+    ) -> SamplerOutput:
+        """`__call__` for a step that `supports_candidates`, from this rank's
+        vocabulary shard of the logits."""
+        pos = input_batch.positions[input_batch.logits_indices]
+        values, token_ids = self.shard_candidates(
+            shard_logits,
+            vocab_start,
+            input_batch.expanded_idx_mapping,
+            input_batch.idx_mapping,
+            input_batch.idx_mapping_np,
+            pos,
+            input_batch.input_ids[input_batch.logits_indices],
+            input_batch.expanded_local_pos,
+            input_batch.seq_lens_cpu_upper_bound.numpy(),
+        )
+        sampled = gumbel_sample_candidates(
+            values,
+            token_ids,
+            input_batch.expanded_idx_mapping,
+            self.sampling_states.temperature.gpu,
+            self.sampling_states.seeds.gpu,
+            pos,
+            use_fp64=self.use_fp64_gumbel,
+        )
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            input_batch.seq_lens.new_ones(input_batch.num_reqs),
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled.view(-1, 1),
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            sampling_mask_tensors=None,
+        )
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()

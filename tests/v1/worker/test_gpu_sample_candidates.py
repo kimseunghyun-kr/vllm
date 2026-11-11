@@ -422,3 +422,92 @@ def test_shard_candidates_match_full_vocabulary_processing():
     )
     assert bad_rows == 0
     assert bad_requests == 0
+
+
+def _make_sampler(vocab_size: int, max_num_reqs: int):
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+    from vllm.v1.worker.gpu.states import RequestState
+
+    device = torch.device("cuda")
+    req_states = RequestState(
+        max_num_reqs=max_num_reqs,
+        max_model_len=64,
+        max_num_batched_tokens=16,
+        num_speculative_steps=1,
+        vocab_size=vocab_size,
+        device=device,
+    )
+    return Sampler(
+        vllm_config=SimpleNamespace(reasoning_config=None),
+        max_num_reqs=max_num_reqs,
+        vocab_size=vocab_size,
+        device=device,
+        req_states=req_states,
+    )
+
+
+def test_sampler_shard_candidates_match_apply_sampling_params(monkeypatch):
+    """`Sampler.shard_candidates` on one shard that holds the whole vocabulary
+    against `Sampler.apply_sampling_params`."""
+    import numpy as np
+
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu.sample import sampler as sampler_module
+
+    monkeypatch.setattr(
+        sampler_module, "tensor_model_parallel_all_gather", lambda x, dim=-1: x
+    )
+    monkeypatch.setattr(
+        sampler_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    vocab_size = 4096
+    params = [
+        SamplingParams(temperature=1.0, top_k=20, top_p=0.95),
+        SamplingParams(temperature=0.7, top_k=5, top_p=0.5),
+        SamplingParams(temperature=0.0),
+        SamplingParams(temperature=1.3, top_k=20),
+        SamplingParams(temperature=1.0, top_k=1, top_p=0.9),
+        SamplingParams(temperature=0.6, top_k=20, top_p=0.8),
+    ]
+    sampler = _make_sampler(vocab_size, len(params))
+    for req_idx, sampling_params in enumerate(params):
+        sampler.add_request(req_idx, sampling_params)
+    sampler.apply_staged_writes()
+    idx_mapping_np = np.arange(len(params), dtype=np.int32)
+    assert sampler.supports_candidates(idx_mapping_np)
+
+    device = torch.device("cuda")
+    idx_mapping = torch.from_numpy(idx_mapping_np).to(device)
+    generator = torch.Generator(device=device).manual_seed(5)
+    logits = (
+        torch.randn(len(params), vocab_size, generator=generator, device=device)
+        .mul_(LOGIT_SPREAD)
+        .to(torch.bfloat16)
+    )
+    context = (
+        idx_mapping,  # expanded_idx_mapping: one logits row per request
+        idx_mapping,
+        idx_mapping_np,
+        torch.arange(100, 100 + len(params), device=device),  # pos
+        torch.zeros(len(params), dtype=torch.int32, device=device),  # input_ids
+        torch.zeros(len(params), dtype=torch.int32, device=device),  # local pos
+        np.ones(len(params), dtype=np.int32),
+    )
+    expected = sampler.apply_sampling_params(logits, *context)
+    values, token_ids = sampler.shard_candidates(logits, 0, *context)
+    is_greedy = torch.tensor([p.temperature == 0.0 for p in params], device=device)
+    rebuilt = torch.full_like(expected, float("-inf")).scatter_(1, token_ids, values)
+    rebuilt = torch.where(is_greedy[:, None], expected.float(), rebuilt)
+    assert torch.equal(rebuilt, expected.float())
+    assert torch.equal(
+        values[is_greedy].max(-1).values, expected[is_greedy].float().max(-1).values
+    )
+
+    sampler.add_request(
+        0, SamplingParams(temperature=1.0, top_k=20, logit_bias={1: 2.0})
+    )
+    assert not sampler.supports_candidates(idx_mapping_np)
+    sampler.add_request(0, SamplingParams(temperature=1.0, top_p=0.9))
+    assert not sampler.supports_candidates(idx_mapping_np)

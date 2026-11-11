@@ -17,6 +17,7 @@ from vllm.v1.worker.gpu.input_batch import (
     get_num_sampled_and_rejected,
 )
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
+from vllm.v1.worker.gpu.sample.candidates import rejection_sample_candidates
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -417,6 +418,73 @@ class RejectionSampler:
             else None
         )
         return sampled, num_sampled, logprobs_tensors, sampling_mask_tensors
+
+    def supports_candidates(
+        self, idx_mapping_np: np.ndarray, draft_logits: DraftLogitsCache | None
+    ) -> bool:
+        """Whether this step can be verified on per-shard top-k candidates:
+        one-hot drafts in the standard mode."""
+        return (
+            draft_logits is None
+            and self.watermark_key is None
+            and self.synthetic_conditional_rates is None
+            and not self.use_block_verification
+            and self.fly_window_size == 0
+            and not self.enable_adaptive_verification
+            and self.sampler.supports_candidates(idx_mapping_np)
+        )
+
+    def verify_candidates(
+        self, shard_logits: torch.Tensor, vocab_start: int, input_batch: InputBatch
+    ) -> SamplerOutput:
+        """`__call__` for a step that `supports_candidates`, from this rank's
+        vocabulary shard of the target logits."""
+        draft_sampled, pos = gather_draft_sampled(
+            input_batch.input_ids,
+            input_batch.positions,
+            input_batch.logits_indices,
+            input_batch.expanded_idx_mapping,
+            input_batch.expanded_local_pos,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        values, token_ids = self.sampler.shard_candidates(
+            shard_logits,
+            vocab_start,
+            input_batch.expanded_idx_mapping,
+            input_batch.idx_mapping,
+            input_batch.idx_mapping_np,
+            pos,
+            draft_sampled,
+            input_batch.expanded_local_pos,
+            input_batch.seq_lens_cpu_upper_bound.numpy(),
+        )
+        sampled, num_sampled = rejection_sample_candidates(
+            values,
+            token_ids,
+            draft_sampled,
+            input_batch.cu_num_logits,
+            pos,
+            input_batch.idx_mapping,
+            self.sampler.sampling_states.temperature.gpu,
+            self.sampler.sampling_states.seeds.gpu,
+            self.num_speculative_steps,
+            use_fp64=self.sampler.use_fp64_gumbel,
+        )
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            num_sampled,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            sampling_mask_tensors=None,
+        )
 
     def __call__(
         self,

@@ -20,6 +20,12 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax, tl_rand32
 
+# Candidates each vocabulary shard sends per row. A row can be sampled from
+# candidates when its top-k is at most MAX_CANDIDATE_TOP_K; the difference
+# covers tokens tied at the k-th value.
+NUM_SHARD_CANDIDATES = 32
+MAX_CANDIDATE_TOP_K = 20
+
 
 @triton.jit
 def _load_candidates(

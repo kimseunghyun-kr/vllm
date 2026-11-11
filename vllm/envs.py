@@ -265,6 +265,7 @@ if TYPE_CHECKING:
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_RAISE_ON_LOGIT_NANS: bool = False
+    VLLM_TOP_K_CANDIDATE_SAMPLING: bool = False
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
         "FP", "INT8", "INT6", "INT4", "INT3", "NONE"
     ] = "NONE"
@@ -1956,6 +1957,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_COMPUTE_NANS_IN_LOGITS": lambda: bool(
         int(os.getenv("VLLM_COMPUTE_NANS_IN_LOGITS", "0"))
         or int(os.getenv("VLLM_RAISE_ON_LOGIT_NANS", "0"))
+    ),
+    # With tensor parallelism, sample top-k requests from the k best logits of
+    # each vocabulary shard instead of all-gathering [num_logits, vocab] logits.
+    "VLLM_TOP_K_CANDIDATE_SAMPLING": lambda: bool(
+        int(os.getenv("VLLM_TOP_K_CANDIDATE_SAMPLING", "0"))
     ),
     # Raise an exception when generated logits contain NaNs. Enabling this
     # also enables the NaN computation required to detect them.
