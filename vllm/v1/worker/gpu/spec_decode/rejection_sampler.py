@@ -8,6 +8,7 @@ import torch
 
 from vllm.config import SpeculativeConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
+from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
@@ -447,7 +448,7 @@ class RejectionSampler:
             input_batch.expanded_local_pos,
             self.sampler.req_states.prefill_len.gpu,
         )
-        values, token_ids = self.sampler.shard_candidates(
+        gathered = self.sampler.shard_candidates(
             shard_logits,
             vocab_start,
             input_batch.expanded_idx_mapping,
@@ -458,15 +459,18 @@ class RejectionSampler:
             input_batch.expanded_local_pos,
             input_batch.seq_lens_cpu_upper_bound.numpy(),
         )
+        sampling_states = self.sampler.sampling_states
         sampled, num_sampled = rejection_sample_candidates(
-            values,
-            token_ids,
+            gathered,
+            get_tensor_model_parallel_world_size(),
             draft_sampled,
             input_batch.cu_num_logits,
             pos,
             input_batch.idx_mapping,
-            self.sampler.sampling_states.temperature.gpu,
-            self.sampler.sampling_states.seeds.gpu,
+            sampling_states.top_k.gpu,
+            sampling_states.top_p.gpu,
+            sampling_states.temperature.gpu,
+            sampling_states.seeds.gpu,
             self.num_speculative_steps,
             use_fp64=self.sampler.use_fp64_gumbel,
         )

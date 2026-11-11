@@ -153,6 +153,7 @@ from vllm.v1.worker.gpu.sample.batch_shard import (
     batch_sharded_sampling_enabled,
     gather_sampler_output,
 )
+from vllm.v1.worker.gpu.sample.candidates import shard_top_k_supported
 from vllm.v1.worker.gpu.sample.logits_processor import build_custom_logits_processors
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
@@ -1725,6 +1726,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # The penalty masks are packed by 32 tokens; ids travel as fp32.
             and lm_head.shard_indices.org_vocab_start_index % 32 == 0
             and self.vocab_size < 2**24
+            and shard_top_k_supported()
         )
 
     def _sample_candidates(

@@ -24,10 +24,7 @@ from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
 from vllm.v1.worker.gpu.sample.candidates import (
     MAX_CANDIDATE_TOP_K,
-    NUM_SHARD_CANDIDATES,
-    finalize_candidates,
     gumbel_sample_candidates,
-    merge_shard_candidates,
     top_k_shard_candidates,
 )
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
@@ -155,12 +152,11 @@ class Sampler:
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
         seq_lens_upper_bound_np: np.ndarray,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Process this rank's vocabulary shard of the logits and reduce the
-        ranks' shards to the kept candidates of each row.
-
-        The result equals the kept entries of `apply_sampling_params` on the
-        gathered logits, in the layout of `sample.candidates`.
+    ) -> torch.Tensor:
+        """Process this rank's vocabulary shard of the logits as
+        `apply_sampling_params` does up to the temperature, and gather the best
+        candidates of every rank's shard: the gathered layout of
+        `sample.candidates`.
         """
         logits = torch.empty_like(shard_logits, dtype=torch.float32).copy_(shard_logits)
         ctx = LogitsContext(
@@ -176,18 +172,8 @@ class Sampler:
         self.sampling_states.apply_temperature(
             logits, expanded_idx_mapping, idx_mapping_np
         )
-        packed = top_k_shard_candidates(logits, vocab_start, NUM_SHARD_CANDIDATES)
-        gathered = tensor_model_parallel_all_gather(packed, dim=-1)
-        values, token_ids = merge_shard_candidates(
-            gathered, get_tensor_model_parallel_world_size()
-        )
-        return finalize_candidates(
-            values,
-            token_ids,
-            expanded_idx_mapping,
-            self.sampling_states.top_k.gpu,
-            self.sampling_states.top_p.gpu,
-        )
+        packed = top_k_shard_candidates(logits, vocab_start, MAX_CANDIDATE_TOP_K)
+        return tensor_model_parallel_all_gather(packed, dim=-1)
 
     def sample_candidates(
         self, shard_logits: torch.Tensor, vocab_start: int, input_batch: InputBatch
@@ -195,7 +181,7 @@ class Sampler:
         """`__call__` for a step that `supports_candidates`, from this rank's
         vocabulary shard of the logits."""
         pos = input_batch.positions[input_batch.logits_indices]
-        values, token_ids = self.shard_candidates(
+        gathered = self.shard_candidates(
             shard_logits,
             vocab_start,
             input_batch.expanded_idx_mapping,
@@ -207,9 +193,11 @@ class Sampler:
             input_batch.seq_lens_cpu_upper_bound.numpy(),
         )
         sampled = gumbel_sample_candidates(
-            values,
-            token_ids,
+            gathered,
+            get_tensor_model_parallel_world_size(),
             input_batch.expanded_idx_mapping,
+            self.sampling_states.top_k.gpu,
+            self.sampling_states.top_p.gpu,
             self.sampling_states.temperature.gpu,
             self.sampling_states.seeds.gpu,
             pos,
