@@ -23,7 +23,7 @@ from collections.abc import Iterable
 from contextlib import AbstractContextManager
 from copy import deepcopy
 from dataclasses import replace
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import numpy as np
 import torch
@@ -350,6 +350,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.sampler: Sampler | None = None
         self.rejection_sampler: RejectionSampler | None = None
         self.batch_sharder: BatchSharder | None = None
+        self.candidate_sampling_enabled = False
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
         self.cudagraph_manager: ModelCudaGraphManager | None = None
@@ -483,6 +484,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     "compute_logits_local",
                     type(self.model).__name__,
                 )
+
+        if envs.VLLM_TOP_K_CANDIDATE_SAMPLING:
+            self.candidate_sampling_enabled = self._candidate_sampling_supported()
+            logger.info(
+                "Top-k candidate sampling %s.",
+                "enabled" if self.candidate_sampling_enabled else "is not supported",
+            )
 
         # Initialize samplers. Model states may override via custom_sampler().
         config_processors = self.model_config.logits_processors or ()
@@ -1706,12 +1714,76 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return block_tables, slot_mappings
 
+    def _uses_candidate_sampling(
+        self, input_batch: InputBatch, grammar_output: GrammarOutput | None
+    ) -> bool:
+        """Whether this step samples from per-shard top-k candidates
+        (VLLM_TOP_K_CANDIDATE_SAMPLING) instead of gathered logits."""
+        if not self.candidate_sampling_enabled or grammar_output is not None:
+            return False
+        if input_batch.num_reqs == 0 or type(self.sampler) is not Sampler:
+            return False
+        idx_mapping_np = input_batch.idx_mapping_np
+        if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
+            return self.sampler.supports_candidates(idx_mapping_np)
+        return (
+            type(self.rejection_sampler) is RejectionSampler
+            and self.speculator is not None
+            and self.rejection_sampler.supports_candidates(
+                idx_mapping_np, self.speculator.draft_logits
+            )
+        )
+
+    def _language_model(self) -> Any:
+        model = cast(Any, self.model)
+        if hasattr(model, "get_language_model"):
+            return model.get_language_model()
+        return model
+
+    def _candidate_sampling_supported(self) -> bool:
+        language_model = self._language_model()
+        lm_head = getattr(language_model, "lm_head", None)
+        return (
+            self.parallel_config.tensor_parallel_size > 1
+            and self.is_last_pp_rank
+            and self.batch_sharder is None
+            and hasattr(self.model, "compute_logits_local")
+            and hasattr(language_model, "logits_processor")
+            and hasattr(lm_head, "shard_indices")
+            # The penalty masks are packed by 32 tokens; ids travel as fp32.
+            and lm_head.shard_indices.org_vocab_start_index % 32 == 0
+            and self.vocab_size < 2**24
+        )
+
+    def _sample_candidates(
+        self, hidden_states: torch.Tensor, input_batch: InputBatch
+    ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        assert self.sampler is not None
+        language_model = self._language_model()
+        lm_head = language_model.lm_head
+        sample_hidden_states = hidden_states[input_batch.logits_indices]
+        shard_logits = cast(Any, self.model).compute_logits_local(sample_hidden_states)
+        language_model.logits_processor._mask_outside_vocab(shard_logits, lm_head)
+        vocab_start = lm_head.shard_indices.org_vocab_start_index
+        if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
+            sampler_output = self.sampler.sample_candidates(
+                shard_logits, vocab_start, input_batch
+            )
+        else:
+            sampler_output = self.rejection_sampler.verify_candidates(
+                shard_logits, vocab_start, input_batch
+            )
+        return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
+
     def sample(
         self,
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        if self._uses_candidate_sampling(input_batch, grammar_output):
+            return self._sample_candidates(hidden_states, input_batch)
+
         shard_metadata = None
         global_input_batch = input_batch
         if self.batch_sharder is not None:
