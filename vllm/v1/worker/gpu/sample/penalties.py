@@ -103,6 +103,27 @@ class PenaltiesState(LogitsProcessor):
         )
         return logits
 
+    def apply_to_shard(
+        self, logits: torch.Tensor, ctx: LogitsContext, vocab_start: int
+    ) -> torch.Tensor:
+        """`apply` for logits of the vocabulary columns that start at `vocab_start`."""
+        if not np.any(self.use_penalty[ctx.idx_mapping_np]):
+            return logits
+        vocab_stop = vocab_start + logits.shape[-1]
+        apply_penalties(
+            logits,
+            ctx.expanded_idx_mapping,
+            ctx.input_ids,
+            ctx.expanded_local_pos,
+            self.repetition_penalty.gpu,
+            self.frequency_penalty.gpu,
+            self.presence_penalty.gpu,
+            self.prompt_bin_mask[:, vocab_start // 32 : -(-vocab_stop // 32)],
+            self.output_bin_counts[:, vocab_start:vocab_stop],
+            vocab_offset=vocab_start,
+        )
+        return logits
+
 
 @triton.jit
 def _penalties_kernel(
@@ -119,6 +140,7 @@ def _penalties_kernel(
     output_bin_counts_ptr,
     output_bin_counts_stride,
     vocab_size,
+    vocab_offset,
     BLOCK_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
@@ -156,7 +178,7 @@ def _penalties_kernel(
     output_bin_counts = base_output_counts
     for prev_pos in tl.range(pos):
         prev_token = tl.load(token_ids_ptr + start_idx + prev_pos + 1)
-        token_match = block == prev_token
+        token_match = block + vocab_offset == prev_token
         output_bin_counts = output_bin_counts + token_match.to(tl.int32)
     output_bin_mask = output_bin_counts > 0
 
@@ -195,7 +217,15 @@ def apply_penalties(
     presence_penalty: torch.Tensor,
     prompt_bin_mask: torch.Tensor,
     output_bin_counts: torch.Tensor,
+    vocab_offset: int = 0,
 ) -> None:
+    """Apply the penalties in place.
+
+    `logits` may hold a vocabulary shard: columns `[vocab_offset, vocab_offset +
+    width)`. `prompt_bin_mask` and `output_bin_counts` must then be the views of
+    the same columns, and `vocab_offset` a multiple of 32 (the mask is packed).
+    """
+    assert vocab_offset % 32 == 0
     num_tokens, vocab_size = logits.shape
     BLOCK_SIZE = PENALTIES_BLOCK_SIZE
     num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
@@ -213,6 +243,7 @@ def apply_penalties(
         output_bin_counts,
         output_bin_counts.stride(0),
         vocab_size,
+        vocab_offset,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
