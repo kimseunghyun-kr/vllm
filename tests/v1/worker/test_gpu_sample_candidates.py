@@ -617,7 +617,7 @@ def test_sampler_shard_candidates_match_apply_sampling_params(monkeypatch):
     from vllm.v1.worker.gpu.sample import sampler as sampler_module
 
     monkeypatch.setattr(
-        sampler_module, "tensor_model_parallel_all_gather", lambda x, dim=-1: x
+        sampler_module, "gather_shard_candidates", lambda packed: packed
     )
     monkeypatch.setattr(
         sampler_module, "get_tensor_model_parallel_world_size", lambda: 1

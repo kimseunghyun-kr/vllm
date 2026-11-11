@@ -9,7 +9,6 @@ import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
-from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import (
@@ -24,6 +23,7 @@ from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
 from vllm.v1.worker.gpu.sample.candidates import (
     MAX_CANDIDATE_TOP_K,
+    gather_shard_candidates,
     gumbel_sample_candidates,
     top_k_shard_candidates,
 )
@@ -176,7 +176,7 @@ class Sampler:
             logits, expanded_idx_mapping, idx_mapping_np
         )
         packed = top_k_shard_candidates(logits, vocab_start, MAX_CANDIDATE_TOP_K)
-        return tensor_model_parallel_all_gather(packed, dim=-1)
+        return gather_shard_candidates(packed)
 
     def sample_candidates(
         self, shard_logits: torch.Tensor, vocab_start: int, input_batch: InputBatch
