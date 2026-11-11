@@ -169,7 +169,7 @@ def _log1p_neg_stable(value):
 
 
 @triton.jit
-def gumbel_noised_argmax(
+def gumbel_noised_logits(
     logits,
     keys,
     mask,
@@ -180,7 +180,8 @@ def gumbel_noised_argmax(
     USE_FP64: tl.constexpr,
     APPLY_TEMPERATURE: tl.constexpr = True,
 ):
-    """Argmax of logits under Gumbel-max sampling, or plain argmax at temp 0.
+    """Logits plus Gumbel noise, or the logits themselves at temp 0. Their
+    argmax is the Gumbel-max sample.
 
     `keys` indexes the noise, so the same token draws the same noise wherever it
     appears; `pos` and `seed` place the draw in the request's stream, which is
@@ -208,8 +209,34 @@ def gumbel_noised_argmax(
             # log1p while preserving precision in the winning tail.
             gumbel_noise = -tl.log(-_log1p_neg_stable(u))
         logits = tl.where(mask, logits + gumbel_noise, float("-inf"))
+    return logits
 
-    return tl.max(logits, axis=0, return_indices=True)
+
+@triton.jit
+def gumbel_noised_argmax(
+    logits,
+    keys,
+    mask,
+    seed,
+    pos,
+    temp,
+    IS_DRAFTING: tl.constexpr,
+    USE_FP64: tl.constexpr,
+    APPLY_TEMPERATURE: tl.constexpr = True,
+):
+    """Maximum and index of `gumbel_noised_logits`."""
+    noised = gumbel_noised_logits(
+        logits,
+        keys,
+        mask,
+        seed,
+        pos,
+        temp,
+        IS_DRAFTING=IS_DRAFTING,
+        USE_FP64=USE_FP64,
+        APPLY_TEMPERATURE=APPLY_TEMPERATURE,
+    )
+    return tl.max(noised, axis=0, return_indices=True)
 
 
 @triton.jit

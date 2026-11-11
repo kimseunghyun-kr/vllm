@@ -2,19 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Candidate-space sampling and verification against the full-vocabulary kernels.
 
-Each case builds processed target logits with a few kept tokens per row and the
-same rows as candidates. `gumbel_sample_candidates` and
-`rejection_sample_candidates` must return the tokens of `gumbel_sample` and
-`rejection_sample` (one-hot drafts, standard mode).
+`gumbel_sample_candidates` and `rejection_sample_candidates` must return the
+tokens of `gumbel_sample` and `rejection_sample` (one-hot drafts, standard
+mode), and keep the tokens that `apply_top_k_top_p` keeps.
 """
 
 import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.candidates import (
+    _kept_candidates,
     gumbel_sample_candidates,
     rejection_sample_candidates,
+    shard_top_k_supported,
+    top_k_shard_candidates,
 )
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sample
@@ -25,20 +28,94 @@ pytestmark = pytest.mark.skipif(
 
 VOCAB_SIZE = 248320
 NUM_CANDIDATES = 20
+NUM_SHARDS = 8
+MERGED_CANDIDATES = 32  # candidates._MERGED_CANDIDATES
 MAX_NUM_REQS = 512
 LOGIT_SPREAD = 3.0
 TOP_P = 0.95
 
 
-def _kept_candidates(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Top-k then top-p (vLLM's PyTorch rule). Candidates sorted by token id."""
+def _reference_kept(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-k then top-p (vLLM's PyTorch rule): values (-inf if dropped), ids."""
     values, token_ids = logits.topk(NUM_CANDIDATES, dim=-1)
     mass_from_here = values.softmax(dim=-1).flip(-1).cumsum(dim=-1).flip(-1)
     dropped = mass_from_here <= 1.0 - TOP_P
     dropped[:, 0] = False
-    values = values.masked_fill(dropped, float("-inf"))
-    token_ids, order = token_ids.sort(dim=-1)
-    return values.gather(1, order).contiguous(), token_ids.contiguous()
+    return values.masked_fill(dropped, float("-inf")), token_ids
+
+
+def _one_shard(values: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+    """Gathered layout of one shard that holds these candidates."""
+    return torch.cat([values, token_ids.to(values.dtype)], dim=-1).contiguous()
+
+
+def _keep_all(batch: "Batch") -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-k and top-p state that keeps every candidate of `batch`."""
+    top_k = torch.full((MAX_NUM_REQS,), NUM_CANDIDATES, dtype=torch.int32)
+    return top_k.to(batch.pos.device), torch.ones(MAX_NUM_REQS, device=batch.pos.device)
+
+
+@triton.jit
+def _kept_candidates_kernel(
+    values_ptr,
+    token_ids_ptr,
+    gathered_ptr,
+    gathered_stride,
+    expanded_idx_mapping_ptr,
+    top_k_ptr,
+    top_p_ptr,
+    num_shards,
+    num_candidates,
+    PADDED_SHARDS: tl.constexpr,
+    PADDED_CANDIDATES: tl.constexpr,
+):
+    logit_idx = tl.program_id(0).to(tl.int64)
+    req_state_idx = tl.load(expanded_idx_mapping_ptr + logit_idx).to(tl.int64)
+    values, token_ids, valid = _kept_candidates(
+        gathered_ptr,
+        gathered_stride,
+        logit_idx,
+        tl.load(top_k_ptr + req_state_idx),
+        tl.load(top_p_ptr + req_state_idx).to(tl.float32),
+        num_shards,
+        num_candidates,
+        PADDED_SHARDS,
+        PADDED_CANDIDATES,
+    )
+    SIZE: tl.constexpr = values.shape[0]
+    out = logit_idx * SIZE + tl.arange(0, SIZE)
+    tl.store(values_ptr + out, values)
+    tl.store(token_ids_ptr + out, tl.where(valid, token_ids, 0))
+
+
+def _kept_logits(
+    gathered: torch.Tensor,
+    num_shards: int,
+    expanded_idx_mapping: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    """`[num_logits, vocab_size]` fp32: the kept candidates, -inf elsewhere."""
+    num_candidates = gathered.shape[1] // (2 * num_shards)
+    shape = (gathered.shape[0], MERGED_CANDIDATES)
+    values = gathered.new_empty(shape)
+    token_ids = gathered.new_empty(shape, dtype=torch.int64)
+    _kept_candidates_kernel[(gathered.shape[0],)](
+        values,
+        token_ids,
+        gathered,
+        gathered.stride(0),
+        expanded_idx_mapping,
+        top_k,
+        top_p,
+        num_shards,
+        num_candidates,
+        PADDED_SHARDS=triton.next_power_of_2(num_shards),
+        PADDED_CANDIDATES=triton.next_power_of_2(num_candidates),
+    )
+    kept = gathered.new_full((gathered.shape[0], vocab_size), float("-inf"))
+    return kept.scatter_reduce_(1, token_ids, values, reduce="amax")
 
 
 class Batch:
@@ -77,7 +154,7 @@ class Batch:
         raw = torch.randn(
             num_logits, VOCAB_SIZE, generator=generator, device=device
         ).mul_(LOGIT_SPREAD)
-        self.values, self.token_ids = _kept_candidates(raw)
+        self.values, self.token_ids = _reference_kept(raw)
         is_greedy_row = self.temperature[self.expanded_idx_mapping.long()] == 0.0
         # Greedy rows have no top-k or top-p mask: every candidate stays.
         unmasked = raw.gather(1, self.token_ids)
@@ -130,12 +207,13 @@ def test_rejection_sample_candidates_matches_full_vocabulary(greedy_share, num_s
             num_steps,
         )
         sampled, num_sampled = rejection_sample_candidates(
-            batch.values,
-            batch.token_ids,
+            _one_shard(batch.values, batch.token_ids),
+            1,
             batch.draft_sampled,
             batch.cu_num_logits,
             batch.pos,
             batch.idx_mapping,
+            *_keep_all(batch),
             batch.temperature,
             batch.seed,
             num_steps,
@@ -166,9 +244,10 @@ def test_gumbel_sample_candidates_matches_full_vocabulary(greedy_share):
             is_drafting=False,
         )
         sampled = gumbel_sample_candidates(
-            batch.values,
-            batch.token_ids,
+            _one_shard(batch.values, batch.token_ids),
+            1,
             batch.expanded_idx_mapping,
+            *_keep_all(batch),
             batch.temperature,
             batch.seed,
             batch.pos,
@@ -212,14 +291,26 @@ def test_report_kernel_times():
             3,
         )
 
+    gathered = _one_shard(batch.values, batch.token_ids).repeat(1, NUM_SHARDS)
+    # Distinct token ids on the other shards, with values that are never kept.
+    gathered = gathered.view(rows, NUM_SHARDS, 2, NUM_CANDIDATES).clone()
+    gathered[:, 1:, 0] = float("-inf")
+    gathered[:, 1:, 1] += VOCAB_SIZE * torch.arange(
+        1, NUM_SHARDS, device=gathered.device
+    ).view(1, -1, 1)
+    gathered = gathered.view(rows, -1)
+    top_k, top_p = _keep_all(batch)
+
     def candidates():
         return rejection_sample_candidates(
-            batch.values,
-            batch.token_ids,
+            gathered,
+            NUM_SHARDS,
             batch.draft_sampled,
             batch.cu_num_logits,
             batch.pos,
             batch.idx_mapping,
+            top_k,
+            top_p,
             batch.temperature,
             batch.seed,
             3,
@@ -244,14 +335,11 @@ def test_report_kernel_times():
     assert bool(_valid_prefix_equal(sampled, num_sampled, expected, expected_num).all())
 
 
-NUM_SHARDS = 8
-SHARD_CANDIDATES = 32
-
-
 class ProcessingCase:
-    """Raw bf16 target logits (with ties) and per-request sampling state."""
+    """Raw bf16 target logits and per-request sampling state. `logit_step`
+    rounds the logits to its multiples, so that many tokens tie."""
 
-    def __init__(self, seed: int):
+    def __init__(self, seed: int, logit_step: float = 0.0):
         from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
         from vllm.v1.worker.gpu.sample.penalties import apply_penalties
 
@@ -267,11 +355,12 @@ class ProcessingCase:
             return torch.rand(*shape, generator=generator, device=device)
 
         num_logits = batch.target_logits.shape[0]
-        self.raw = (
-            torch.randn(num_logits, VOCAB_SIZE, generator=generator, device=device)
-            .mul_(LOGIT_SPREAD)
-            .to(torch.bfloat16)
-        )
+        raw = torch.randn(
+            num_logits, VOCAB_SIZE, generator=generator, device=device
+        ).mul_(LOGIT_SPREAD)
+        if logit_step:
+            raw = raw.div_(logit_step).round_().mul_(logit_step)
+        self.raw = raw.to(torch.bfloat16)
         greedy = batch.temperature == 0.0
         choice = uniform(MAX_NUM_REQS)
         batch.temperature = torch.where(
@@ -335,13 +424,7 @@ class ProcessingCase:
             logits, self.top_k[requests], self.top_p[requests], has_topp_only_rows=False
         )
 
-    def candidates(self) -> tuple[torch.Tensor, torch.Tensor]:
-        from vllm.v1.worker.gpu.sample.candidates import (
-            finalize_candidates,
-            merge_shard_candidates,
-            top_k_shard_candidates,
-        )
-
+    def gathered_candidates(self) -> torch.Tensor:
         width = VOCAB_SIZE // NUM_SHARDS
         packed = []
         for start in range(0, VOCAB_SIZE, width):
@@ -353,37 +436,77 @@ class ProcessingCase:
                 self.output_bin_counts[:, start : start + width],
                 start,
             )
-            packed.append(top_k_shard_candidates(logits, start, SHARD_CANDIDATES))
-        values, token_ids = merge_shard_candidates(
-            torch.cat(packed, dim=-1), NUM_SHARDS
-        )
-        return finalize_candidates(
-            values, token_ids, self.batch.expanded_idx_mapping, self.top_k, self.top_p
-        )
+            packed.append(top_k_shard_candidates(logits, start, NUM_CANDIDATES))
+        return torch.cat(packed, dim=-1)
 
 
-def test_shard_candidates_match_full_vocabulary_processing():
-    """Per-shard processing + top-k + merge against the full-vocabulary chain
-    (penalties, temperature, top-k, top-p), then sampling and verification."""
-    rows = bad_rows = bad_requests = requests_total = 0
+needs_shard_top_k = pytest.mark.skipif(
+    not shard_top_k_supported(), reason="needs FlashInfer top-k with a tie-break"
+)
+
+
+@needs_shard_top_k
+def test_shard_top_k_prefers_lower_token_ids():
+    """Among equal logits at the selection boundary, the lower columns win."""
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(3)
+    width, vocab_start = VOCAB_SIZE // NUM_SHARDS, 64
+    logits = torch.randint(0, 6, (96, width), generator=generator, device=device)
+    logits = logits.float()
+    logits[0] = 1.0  # every column ties
+    packed = top_k_shard_candidates(logits, vocab_start, NUM_CANDIDATES)
+    values = packed[:, :NUM_CANDIDATES]
+    columns = packed[:, NUM_CANDIDATES:].long() - vocab_start
+    expected = logits.sort(dim=-1, descending=True, stable=True)
+    assert torch.equal(
+        columns.sort(dim=-1).values,
+        expected.indices[:, :NUM_CANDIDATES].sort(dim=-1).values,
+    )
+    assert torch.equal(values, logits.gather(1, columns))
+
+
+@needs_shard_top_k
+@pytest.mark.parametrize("logit_step", [0.0, 0.5])
+def test_shard_candidates_match_full_vocabulary_processing(logit_step):
+    """Per-shard processing + top-k, then the fused kernels, against the
+    full-vocabulary chain (penalties, temperature, top-k, top-p, sampling and
+    verification)."""
+    rows = bad_rows = bad_samples = bad_requests = requests_total = 0
+    over_kept_rows = 0
     for seed in range(4):
-        case = ProcessingCase(seed)
+        case = ProcessingCase(seed, logit_step)
         batch = case.batch
         expected = case.full_vocabulary()
-        values, token_ids = case.candidates()
+        gathered = case.gathered_candidates()
         is_greedy_row = batch.temperature[batch.expanded_idx_mapping.long()] == 0.0
-        rebuilt = torch.full_like(expected, float("-inf")).scatter_(
-            1, token_ids, values
+        kept = _kept_logits(
+            gathered,
+            NUM_SHARDS,
+            batch.expanded_idx_mapping,
+            case.top_k,
+            case.top_p,
+            VOCAB_SIZE,
         )
-        # A greedy row keeps its whole vocabulary: compare it on the candidates.
-        rebuilt = torch.where(is_greedy_row[:, None], expected, rebuilt)
-        on_candidates = expected.gather(1, token_ids)
-        same = (rebuilt == expected).all(dim=-1) & (
-            ~is_greedy_row | (on_candidates == values).all(dim=-1)
+        # A greedy row keeps its whole vocabulary: compare its best logit.
+        same = torch.where(
+            is_greedy_row,
+            kept.max(dim=-1).values == expected.max(dim=-1).values,
+            (kept == expected).all(dim=-1),
         )
-        same &= ~is_greedy_row | (
-            values.max(dim=-1).values == expected.max(dim=-1).values
-        )
+        # With ties at the top-k boundary, apply_top_k_top_p can keep more than
+        # top-k tokens. Such a row cannot match.
+        requests = batch.expanded_idx_mapping.long()
+        over_kept = (expected > float("-inf")).sum(dim=-1) > case.top_k[requests]
+        over_kept &= ~is_greedy_row
+        for row in (~same & ~over_kept).nonzero()[:4, 0].tolist():
+            print(
+                f"row {row}: top_k {int(case.top_k[requests[row]])} "
+                f"top_p {float(case.top_p[requests[row]]):.2f} "
+                f"kept {int((kept[row] > float('-inf')).sum())} "
+                f"expected {int((expected[row] > float('-inf')).sum())}"
+            )
+        same |= over_kept
+        over_kept_rows += int(over_kept.sum())
         rows += same.numel()
         bad_rows += int((~same).sum())
 
@@ -401,26 +524,62 @@ def test_shard_candidates_match_full_vocabulary_processing():
             batch.num_steps,
         )
         tokens, num = rejection_sample_candidates(
-            values,
-            token_ids,
+            gathered,
+            NUM_SHARDS,
             batch.draft_sampled,
             batch.cu_num_logits,
             batch.pos,
             batch.idx_mapping,
+            case.top_k,
+            case.top_p,
             batch.temperature,
             batch.seed,
             batch.num_steps,
         )
         equal = _valid_prefix_equal(tokens, num, full_tokens, full_num)
+        row_starts = batch.cu_num_logits[:-1].long()
+        request_over_kept = torch.stack(
+            [
+                over_kept[start:stop].any()
+                for start, stop in zip(row_starts, batch.cu_num_logits[1:].long())
+            ]
+        )
         requests_total += equal.numel()
-        bad_requests += int((~equal).sum())
-        kept = (expected > float("-inf")).sum(-1)[~is_greedy_row].float()
-        print(f"seed {seed}: kept per row mean {kept.mean():.2f} max {kept.max():.0f}")
+        bad_requests += int((~equal & ~request_over_kept).sum())
+        sampled = gumbel_sample_candidates(
+            gathered,
+            NUM_SHARDS,
+            batch.expanded_idx_mapping,
+            case.top_k,
+            case.top_p,
+            batch.temperature,
+            batch.seed,
+            batch.pos,
+        )
+        full_sampled = gumbel_sample(
+            expected,
+            batch.expanded_idx_mapping,
+            batch.temperature,
+            batch.seed,
+            batch.pos,
+            apply_temperature=False,
+            is_drafting=False,
+        )
+        bad_samples += int(((sampled != full_sampled) & ~over_kept).sum())
+        num_kept = (expected > float("-inf")).sum(-1)[~is_greedy_row].float()
+        print(
+            f"step {logit_step} seed {seed}: kept per row mean {num_kept.mean():.2f} "
+            f"max {num_kept.max():.0f}"
+        )
     print(
-        f"rows {rows}, rows with a different kept set or value {bad_rows}; "
+        f"rows {rows}, rows where the full path keeps more than top-k "
+        f"{over_kept_rows}, other rows with a different kept set or value {bad_rows}, "
+        f"with a different sample {bad_samples}; "
         f"requests {requests_total}, requests with different tokens {bad_requests}"
     )
+    assert logit_step or over_kept_rows == 0
     assert bad_rows == 0
+    assert bad_samples == 0
     assert bad_requests == 0
 
 
@@ -448,6 +607,7 @@ def _make_sampler(vocab_size: int, max_num_reqs: int):
     )
 
 
+@needs_shard_top_k
 def test_sampler_shard_candidates_match_apply_sampling_params(monkeypatch):
     """`Sampler.shard_candidates` on one shard that holds the whole vocabulary
     against `Sampler.apply_sampling_params`."""
@@ -496,14 +656,19 @@ def test_sampler_shard_candidates_match_apply_sampling_params(monkeypatch):
         np.ones(len(params), dtype=np.int32),
     )
     expected = sampler.apply_sampling_params(logits, *context)
-    values, token_ids = sampler.shard_candidates(logits, 0, *context)
-    is_greedy = torch.tensor([p.temperature == 0.0 for p in params], device=device)
-    rebuilt = torch.full_like(expected, float("-inf")).scatter_(1, token_ids, values)
-    rebuilt = torch.where(is_greedy[:, None], expected.float(), rebuilt)
-    assert torch.equal(rebuilt, expected.float())
-    assert torch.equal(
-        values[is_greedy].max(-1).values, expected[is_greedy].float().max(-1).values
+    gathered = sampler.shard_candidates(logits, 0, *context)
+    kept = _kept_logits(
+        gathered,
+        1,
+        idx_mapping,
+        sampler.sampling_states.top_k.gpu,
+        sampler.sampling_states.top_p.gpu,
+        vocab_size,
     )
+    is_greedy = torch.tensor([p.temperature == 0.0 for p in params], device=device)
+    expected = expected.float()
+    assert torch.equal(kept[~is_greedy], expected[~is_greedy])
+    assert torch.equal(kept[is_greedy].argmax(-1), expected[is_greedy].argmax(-1))
 
     sampler.add_request(
         0, SamplingParams(temperature=1.0, top_k=20, logit_bias={1: 2.0})
