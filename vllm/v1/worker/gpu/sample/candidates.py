@@ -25,6 +25,8 @@ applied), then their token ids as fp32.
 
 import torch
 
+from vllm.distributed import get_tp_group, tensor_model_parallel_all_gather
+from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
 from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_logits, tl_rand32
@@ -62,6 +64,19 @@ def top_k_shard_candidates(
         logits, num_candidates, deterministic=True, tie_break=TopKTieBreak.SMALL
     )
     return torch.cat([values, (columns + vocab_start).to(values.dtype)], dim=-1)
+
+
+def gather_shard_candidates(packed: torch.Tensor) -> torch.Tensor:
+    """All-gather `top_k_shard_candidates` of every rank into the gathered
+    layout. The payload is small, so the one-shot custom all-gather serves it
+    when it is available; NCCL otherwise."""
+    communicator = get_tp_group().device_communicator
+    if isinstance(communicator, CudaCommunicator):
+        gathered = communicator.custom_all_gather(packed)
+        if gathered is not None:
+            # Rank-major rows to rank-major shards of each row.
+            return gathered.view(-1, *packed.shape).movedim(0, -2).flatten(-2)
+    return tensor_model_parallel_all_gather(packed, dim=-1)
 
 
 @triton.jit
