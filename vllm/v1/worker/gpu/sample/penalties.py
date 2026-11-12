@@ -146,7 +146,9 @@ class PenaltiesState(LogitsProcessor):
         if not np.all(self.use_sparse[reqs] | ~self.use_penalty[reqs]):
             return None
         prompt_lens = self.req_states.prompt_len.np[reqs]
-        max_output_len = int(np.max(ctx.seq_lens_upper_bound_np - prompt_lens))
+        # The runner pads the bounds to the batch size of its CUDA graph.
+        seq_lens = ctx.seq_lens_upper_bound_np[: len(reqs)]
+        max_output_len = int(np.max(seq_lens - prompt_lens))
         if max_output_len > MAX_SPARSE_OUTPUT_TOKENS:
             return None
         return max_output_len

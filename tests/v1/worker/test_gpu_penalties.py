@@ -81,8 +81,12 @@ def test_penalties_match_dense_kernel_over_decode_steps(sampling_params):
             expanded_local_pos=local_pos,
             input_ids=tokens,
             pos=torch.zeros(num_rows, dtype=torch.int64, device=device),
-            seq_lens_upper_bound_np=np.full(
-                num_reqs, PROMPT_LEN + num_outputs + NUM_STEPS + 1, dtype=np.int32
+            # Padded with zeros, as the runner pads it to its CUDA graph size.
+            seq_lens_upper_bound_np=np.pad(
+                np.full(
+                    num_reqs, PROMPT_LEN + num_outputs + NUM_STEPS + 1, dtype=np.int32
+                ),
+                (0, 3),
             ),
         )
         expected = logits.clone()
