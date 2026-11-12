@@ -21,6 +21,9 @@ if TYPE_CHECKING:
 
 # Overridden on CPU in vllm/v1/worker/cpu/shm.py.
 PENALTIES_BLOCK_SIZE = 8192
+# Requests with at most this many output tokens can take the sparse kernel.
+MAX_SPARSE_OUTPUT_TOKENS = 4096
+SPARSE_BLOCK_SIZE = 1024
 
 
 class PenaltiesState(LogitsProcessor):
@@ -48,6 +51,18 @@ class PenaltiesState(LogitsProcessor):
         self.output_bin_counts = torch.zeros(
             max_num_reqs, vocab_size, dtype=torch.int32, device=self.device
         )
+        # Distinct output tokens of each request, appended by `post_update`.
+        self.output_tokens = torch.zeros(
+            max_num_reqs,
+            MAX_SPARSE_OUTPUT_TOKENS,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.num_output_tokens = torch.zeros(
+            max_num_reqs, dtype=torch.int32, device=self.device
+        )
+        # Whether a request's penalties depend on its output tokens only.
+        self.use_sparse = np.zeros(max_num_reqs, dtype=bool)
 
         self._new_penalties_reqs: list[int] = []
 
@@ -58,6 +73,7 @@ class PenaltiesState(LogitsProcessor):
 
         do_penalty = use_penalty(sampling_params)
         self.use_penalty[req_idx] = do_penalty
+        self.use_sparse[req_idx] = sampling_params.repetition_penalty == 1.0
         if do_penalty:
             self._new_penalties_reqs.append(req_idx)
         return do_penalty
@@ -70,6 +86,10 @@ class PenaltiesState(LogitsProcessor):
 
             prefill_lens = self.req_states.prefill_len.np[self._new_penalties_reqs]
             max_prefill_len = int(prefill_lens.max())
+            # A resumed request has output tokens that `bincount` does not list.
+            prompt_lens = self.req_states.prompt_len.np[self._new_penalties_reqs]
+            self.use_sparse[self._new_penalties_reqs] &= prefill_lens == prompt_lens
+            self.num_output_tokens.index_fill_(0, idx_mapping, 0)
             bincount(
                 idx_mapping,
                 self.req_states.all_token_ids.gpu,
@@ -90,6 +110,22 @@ class PenaltiesState(LogitsProcessor):
             # No request uses penalties. Skip the kernel launch.
             return logits
 
+        max_output_len = self._max_sparse_output_len(ctx)
+        if max_output_len is not None:
+            apply_sparse_penalties(
+                logits,
+                ctx.expanded_idx_mapping,
+                ctx.input_ids,
+                ctx.expanded_local_pos,
+                self.frequency_penalty.gpu,
+                self.presence_penalty.gpu,
+                self.output_tokens,
+                self.num_output_tokens,
+                self.output_bin_counts,
+                max_output_len,
+            )
+            return logits
+
         apply_penalties(
             logits,
             ctx.expanded_idx_mapping,
@@ -102,6 +138,119 @@ class PenaltiesState(LogitsProcessor):
             self.output_bin_counts,
         )
         return logits
+
+    def _max_sparse_output_len(self, ctx: LogitsContext) -> int | None:
+        """Upper bound of the batch's output lengths if every row can take the
+        sparse kernel, else None."""
+        reqs = ctx.idx_mapping_np
+        if not np.all(self.use_sparse[reqs] | ~self.use_penalty[reqs]):
+            return None
+        prompt_lens = self.req_states.prompt_len.np[reqs]
+        max_output_len = int(np.max(ctx.seq_lens_upper_bound_np - prompt_lens))
+        if max_output_len > MAX_SPARSE_OUTPUT_TOKENS:
+            return None
+        return max_output_len
+
+
+@triton.jit
+def _sparse_penalties_kernel(
+    logits_ptr,
+    logits_stride,
+    expanded_idx_mapping_ptr,
+    token_ids_ptr,
+    expanded_local_pos_ptr,
+    frequency_penalty_ptr,
+    presence_penalty_ptr,
+    output_tokens_ptr,
+    output_tokens_stride,
+    num_output_tokens_ptr,
+    output_bin_counts_ptr,
+    output_bin_counts_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(0).to(tl.int64)
+    block_idx = tl.program_id(1)
+    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx).to(tl.int64)
+    freq_penalty = tl.load(frequency_penalty_ptr + req_state_idx)
+    pres_penalty = tl.load(presence_penalty_ptr + req_state_idx)
+    if freq_penalty == 0.0 and pres_penalty == 0.0:
+        return
+
+    row_ptr = logits_ptr + token_idx * logits_stride
+    counts_ptr = output_bin_counts_ptr + req_state_idx * output_bin_counts_stride
+    pos = tl.load(expanded_local_pos_ptr + token_idx)
+    start_idx = token_idx - pos
+
+    # The request's distinct output tokens, as _penalties_kernel treats them.
+    offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < tl.load(num_output_tokens_ptr + req_state_idx)
+    tokens = tl.load(
+        output_tokens_ptr + req_state_idx * output_tokens_stride + offsets,
+        mask=mask,
+        other=0,
+    ).to(tl.int64)
+    counts = tl.load(counts_ptr + tokens, mask=mask, other=0)
+    for prev_pos in tl.range(pos):
+        draft = tl.load(token_ids_ptr + start_idx + prev_pos + 1).to(tl.int64)
+        counts = counts + (tokens == draft).to(tl.int32)
+    logits = tl.load(row_ptr + tokens, mask=mask, other=0.0).to(tl.float32)
+    logits -= freq_penalty * counts
+    logits -= pres_penalty * (counts > 0)
+    tl.store(row_ptr + tokens, logits, mask=mask)
+
+    if block_idx != 0:
+        return
+    # Draft tokens of earlier positions that are not output tokens yet: each
+    # distinct one once, at its first position.
+    for prev_pos in tl.range(pos):
+        draft = tl.load(token_ids_ptr + start_idx + prev_pos + 1).to(tl.int64)
+        if tl.load(counts_ptr + draft) == 0:
+            occurrences = 0
+            is_first = True
+            for other_pos in tl.range(pos):
+                other = tl.load(token_ids_ptr + start_idx + other_pos + 1)
+                if other.to(tl.int64) == draft:
+                    occurrences += 1
+                    if other_pos < prev_pos:
+                        is_first = False
+            if is_first:
+                logit = tl.load(row_ptr + draft).to(tl.float32)
+                logit -= freq_penalty * occurrences
+                logit -= pres_penalty
+                tl.store(row_ptr + draft, logit)
+
+
+def apply_sparse_penalties(
+    logits: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    token_ids: torch.Tensor,
+    expanded_local_pos: torch.Tensor,
+    frequency_penalty: torch.Tensor,
+    presence_penalty: torch.Tensor,
+    output_tokens: torch.Tensor,
+    num_output_tokens: torch.Tensor,
+    output_bin_counts: torch.Tensor,
+    max_output_len: int,
+) -> None:
+    """`apply_penalties` for rows without a repetition penalty, in place and
+    bitwise equal: it visits only the tokens a request has produced, not the
+    vocabulary. `max_output_len` bounds the requests' output lengths."""
+    num_blocks = max(1, triton.cdiv(max_output_len, SPARSE_BLOCK_SIZE))
+    _sparse_penalties_kernel[(logits.shape[0], num_blocks)](
+        logits,
+        logits.stride(0),
+        expanded_idx_mapping,
+        token_ids,
+        expanded_local_pos,
+        frequency_penalty,
+        presence_penalty,
+        output_tokens,
+        output_tokens.stride(0),
+        num_output_tokens,
+        output_bin_counts,
+        output_bin_counts.stride(0),
+        BLOCK_SIZE=SPARSE_BLOCK_SIZE,
+    )
 
 
 @triton.jit

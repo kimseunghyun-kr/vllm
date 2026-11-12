@@ -1798,10 +1798,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         draft_tokens: torch.Tensor | None = None,
     ) -> None:
         # Update the number of computed tokens.
-        output_bin_counts = None
+        output_bin_counts = output_tokens = num_output_tokens = None
         if self.is_last_pp_rank:
             assert self.sampler is not None
-            output_bin_counts = self.sampler.penalties_state.output_bin_counts
+            penalties_state = self.sampler.penalties_state
+            output_bin_counts = penalties_state.output_bin_counts
+            if output_bin_counts is not None:
+                output_tokens = penalties_state.output_tokens
+                num_output_tokens = penalties_state.num_output_tokens
         post_update(
             idx_mapping,
             self.req_states.num_computed_tokens.gpu,
@@ -1815,6 +1819,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.total_len.gpu,
             draft_tokens,
             self.req_states.draft_tokens,
+            output_tokens,
+            num_output_tokens,
         )
 
         self.model_state.postprocess_state(
