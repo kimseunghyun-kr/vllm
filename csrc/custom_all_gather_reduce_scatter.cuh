@@ -19,23 +19,31 @@ __global__ void __launch_bounds__(512, 1)
     cross_device_all_gather(RankData* _dp, RankSignals sg, Signal* self_sg,
                             CopyPack* __restrict__ result, int rank,
                             int size_per_rank) {
-  auto dp = *_dp;
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int stride = gridDim.x * blockDim.x;
-  barrier_at_start<ngpus>(sg, self_sg, rank);
   // Each rank starts at its own shard, so the peers read different sources at
-  // the same time, and the loads from all sources are issued before the stores.
+  // the same time. The rotated pointers are read once, as in
+  // cross_device_reduce_2stage: a runtime index into a copy of RankData would
+  // keep that copy in local memory.
+  const CopyPack* srcs[ngpus];
+  CopyPack* dsts[ngpus];
+#pragma unroll
+  for (int i = 0; i < ngpus; ++i) {
+    int src_rank = (rank + i) % ngpus;
+    srcs[i] = reinterpret_cast<const CopyPack*>(_dp->ptrs[src_rank]);
+    dsts[i] = result + src_rank * size_per_rank;
+  }
+  barrier_at_start<ngpus>(sg, self_sg, rank);
+  // The loads from all sources are issued before the stores.
   for (int idx = tid; idx < size_per_rank; idx += stride) {
     CopyPack packs[ngpus];
 #pragma unroll
     for (int i = 0; i < ngpus; ++i) {
-      int src_rank = (rank + i) % ngpus;
-      packs[i] = reinterpret_cast<const CopyPack*>(dp.ptrs[src_rank])[idx];
+      packs[i] = srcs[i][idx];
     }
 #pragma unroll
     for (int i = 0; i < ngpus; ++i) {
-      int src_rank = (rank + i) % ngpus;
-      result[src_rank * size_per_rank + idx] = packs[i];
+      dsts[i][idx] = packs[i];
     }
   }
   barrier_at_end<ngpus, true>(sg, self_sg, rank);
