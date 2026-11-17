@@ -83,6 +83,53 @@ STATE_INDEX_FIELDS = (
     "non_spec_state_indices_tensor",
     "prefill_state_indices",
 )
+# Capture buffers by row meaning: one row for each sequence, one offset more
+# than the sequences (cu_seqlens and chunk offsets), one row for each token.
+CAPTURE_SEQUENCE_FIELDS = (
+    *STATE_INDEX_FIELDS,
+    "num_accepted_tokens",
+    "has_initial_state",
+    "prefill_has_initial_state",
+)
+CAPTURE_OFFSET_FIELDS = (
+    "spec_query_start_loc",
+    "non_spec_query_start_loc",
+    "decode_query_start_loc",
+    "non_spec_prefill_query_start_loc",
+    "chunk_offsets",
+)
+CAPTURE_TOKEN_FIELDS = ("spec_token_indx", "non_spec_token_indx")
+
+
+def max_capture_sequences(max_num_seqs: int, num_tokens: int) -> int:
+    """Most sequences of one kind in a batch of at most `num_tokens` tokens.
+
+    Each sequence of a batch has at least one token.
+    """
+    return min(max_num_seqs, max(num_tokens, 1))
+
+
+def capture_views(
+    capture_buffers: dict[str, torch.Tensor], num_tokens: int
+) -> dict[str, torch.Tensor]:
+    """Prefix views of the capture buffers for a graph of `num_tokens` tokens.
+
+    A batch that replays the graph has at most `max_capture_sequences` rows
+    in each sequence buffer, so the rows after them are pads in every such
+    batch, and each view keeps the pad rule of its buffer. The captured
+    forward then gathers and launches for these rows, not for `max_num_seqs`.
+    """
+    num_seqs = max_capture_sequences(
+        capture_buffers["non_spec_state_indices_tensor"].shape[0], num_tokens
+    )
+    views = dict(capture_buffers)
+    for name in CAPTURE_SEQUENCE_FIELDS:
+        views[name] = capture_buffers[name][:num_seqs]
+    for name in CAPTURE_OFFSET_FIELDS:
+        views[name] = capture_buffers[name][: num_seqs + 1]
+    for name in CAPTURE_TOKEN_FIELDS:
+        views[name] = capture_buffers[name][:num_tokens]
+    return views
 
 
 def plan_flashinfer_checkpoints(
@@ -998,10 +1045,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         `capture_buffers`. The metadata fields keep their own tensors."""
         buffers = self.mixed_batch_buffers
         capture_buffers = dict(metadata.capture_buffers or {})
+        # capture_views() of the graph that this batch replays keeps these rows.
+        max_num_rows = max_capture_sequences(
+            buffers["non_spec_state_indices_tensor"].shape[0],
+            metadata.num_actual_tokens,
+        )
         for name, rows in values.items():
             buffer = buffers[name]
             if rows is None:
                 rows = buffer[:0]
+            assert name in CAPTURE_TOKEN_FIELDS or len(rows) <= max_num_rows + (
+                name in CAPTURE_OFFSET_FIELDS
+            ), f"{name}: {len(rows)} rows for {metadata.num_actual_tokens} tokens"
             pad_value: int | bool | torch.Tensor | None = CAPTURE_PAD_VALUES[name]
             if pad_value is None:
                 pad_value = rows[-1] if len(rows) > 0 else 0

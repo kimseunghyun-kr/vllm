@@ -858,6 +858,89 @@ def test_capture_buffers_hold_any_batch(update_block_table: bool, mamba_cache_mo
         assert meta.nums_dict[8]["tot"] == num_programs
 
 
+# Batches whose sequences have one token each: they fill every sequence row
+# of a graph with as many tokens.
+ONE_TOKEN_BATCHES = {
+    "one_token_decodes": ([40, 30, 20, 25], [1, 1, 1, 1], None),
+    "one_token_first_chunks": ([1, 1, 1], [1, 1, 1], None),
+}
+
+
+@pytest.mark.parametrize("num_pad_tokens", [0, 1, 37, 1000])
+def test_capture_views_hold_any_batch_of_the_graph(num_pad_tokens: int):
+    """A graph of `num_tokens` tokens reads `capture_views`: prefixes of the
+    capture buffers with at most `num_tokens` sequence rows. For each batch
+    that the graph can replay, each view has the batch's rows and then pads,
+    as the full buffer has, and the chunk and program counts that the
+    captured forward derives from the views cover the batch."""
+    from vllm.third_party.flash_linear_attention.ops.index import (
+        prepare_chunk_indices,
+        prepare_chunk_offsets,
+    )
+    from vllm.utils.math_utils import cdiv
+    from vllm.v1.attention.backends.gdn_attn import (
+        CAPTURE_OFFSET_FIELDS,
+        CAPTURE_PAD_VALUES,
+        CAPTURE_SEQUENCE_FIELDS,
+        capture_views,
+    )
+
+    builder, reference_builder = (
+        _create_gdn_builder(num_speculative_tokens=2) for _ in range(2)
+    )
+    for each_builder in (builder, reference_builder):
+        each_builder.vllm_config.cache_config.mamba_cache_mode = "none"
+    builder.captures_mixed_batches = True
+    max_num_seqs = builder.vllm_config.scheduler_config.max_num_seqs
+    num_buffer_tokens = builder.mixed_batch_buffers["non_spec_token_indx"].shape[0]
+    batches = {**MIXED_BATCHES, **DECODE_BATCHES, **ONE_TOKEN_BATCHES}
+    for name in [*batches, *reversed(batches)]:
+        seq_lens, query_lens, draft_tokens = batches[name]
+        batch = BatchSpec(seq_lens=seq_lens, query_lens=query_lens)
+        block_table = torch.randint(1, 1000, (batch.batch_size, 3), dtype=torch.int32)
+        reference = _build(reference_builder, batch, draft_tokens, block_table)
+        meta = _build(builder, batch, draft_tokens, block_table)
+        assert meta.capture_buffers is not None
+        num_tokens = min(sum(query_lens) + num_pad_tokens, num_buffer_tokens)
+        views = capture_views(meta.capture_buffers, num_tokens)
+
+        num_seqs = min(max_num_seqs, num_tokens)
+        for field in CAPTURE_SEQUENCE_FIELDS:
+            assert views[field].shape[0] == num_seqs, (name, field)
+        for field in CAPTURE_OFFSET_FIELDS:
+            assert views[field].shape[0] == num_seqs + 1, (name, field)
+        for field, rows in _expected_capture_rows(reference, num_tokens).items():
+            _assert_rows_then_pad(views[field], rows, CAPTURE_PAD_VALUES[field], name)
+
+        prefill_qsl = reference.prefill_query_start_loc
+        if prefill_qsl is None:
+            prefill_qsl = torch.zeros(2, dtype=torch.int32)
+        num_chunks = cdiv(num_tokens, 64) + num_seqs - 1
+        _assert_rows_then_pad(
+            views["chunk_indices"][:num_chunks],
+            prepare_chunk_indices(prefill_qsl, 64),
+            torch.tensor([-1, 0]),
+            name,
+        )
+        _assert_rows_then_pad(
+            views["chunk_offsets"], prepare_chunk_offsets(prefill_qsl, 64), None, name
+        )
+        assert meta.nums_dict is not None
+        assert meta.nums_dict[8]["tot"] <= cdiv(num_tokens, 8) + num_seqs - 1, name
+
+
+def test_capture_staging_rejects_more_rows_than_tokens():
+    """`capture_views` holds a batch only if each of its sequences has a
+    token. PIECEWISE batches have no padding requests; a batch that has them
+    must fail and not lose rows."""
+    builder = _create_gdn_builder()
+    builder.vllm_config.cache_config.mamba_cache_mode = "none"
+    builder.captures_mixed_batches = True
+    batch = BatchSpec(seq_lens=[40, 16, 16], query_lens=[1, 0, 0])
+    with pytest.raises(AssertionError, match="rows for 1 tokens"):
+        _build(builder, batch)
+
+
 @pytest.mark.parametrize(
     "cudagraph_mode, staged",
     [

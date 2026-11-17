@@ -92,7 +92,39 @@ BATCHES = {
     # the captured core causal_conv1d_fn, so only this one may differ.
     "decode_only": ([40, 30, 20], [1, 1, 1], None, None),
 }
-NOT_BITWISE_BATCHES = {"decode_only"}
+# Batches of a graph with fewer tokens than MAX_NUM_SEQS: the captured core
+# reads `capture_views` of that many sequence rows, so the last two batches
+# fill every row.
+SMALL_BATCHES = {
+    "spec_and_prefill": ([20, 65, 100], [3, 1, 4], [2, -1, -1], None),
+    "spec_only": ([20, 30], [3, 3], [2, 2], None),
+    "prefill_only": ([40, 57], [5, 3], [-1, -1], None),
+    "decode_and_prefill": ([40, 41, 200], [1, 1, 6], None, None),
+    "spec_and_one_token_prefills": ([30, 1, 1], [3, 1, 1], [2, -1, -1], None),
+    "all_tokens": ([30, 90], [3, 5], [2, -1], None),
+    "zero_length_rows": ([40, 100, 16, 16], [1, 5, 0, 0], None, None),
+    "spec_and_zero_length_rows": ([65, 20, 16], [1, 3, 0], [-1, 2, -1], None),
+    "spec_across_block_boundary_and_prefill": (
+        [33, 34, 64],
+        [3, 3, 2],
+        [2, 2, -1],
+        None,
+    ),
+    "one_token_prefills_max_sequences": (
+        [40] + [1] * 7,
+        [1] * 8,
+        None,
+        [False] + [True] * 7,
+    ),
+    "decode_only_max_sequences": (
+        [40, 30, 20, 25, 35, 45, 50, 55],
+        [1] * 8,
+        None,
+        None,
+    ),
+}
+NUM_SMALL_CAPTURED_TOKENS = 8
+NOT_BITWISE_BATCHES = {"decode_only", "decode_only_max_sequences"}
 # Tolerance of NOT_BITWISE_BATCHES: the conv rounding reaches the state.
 NOT_BITWISE_TOLERANCE = 6e-2
 
@@ -129,9 +161,9 @@ def _make_builder(
 
 
 def _build(
-    builder: GDNAttentionMetadataBuilder, name: str, device: torch.device
+    builder: GDNAttentionMetadataBuilder, batch_spec: tuple, device: torch.device
 ) -> GDNAttentionMetadata:
-    seq_lens, query_lens, draft_tokens, is_prefilling = BATCHES[name]
+    seq_lens, query_lens, draft_tokens, is_prefilling = batch_spec
     batch = BatchSpec(seq_lens=seq_lens, query_lens=query_lens)
     # A distinct state block per entry; block 0 is the null block. "align"
     # mode takes the 1 + NUM_SPEC blocks from each row's current block on.
@@ -226,11 +258,24 @@ def _forward_context(meta: GDNAttentionMetadata, mode: CUDAGraphMode):
     not current_platform.is_cuda() or current_platform.is_device_capability_family(100),
     reason="Needs CUDA graphs and the Triton/FLA chunk kernels (not on SM10x).",
 )
+@pytest.mark.parametrize(
+    ("num_captured_tokens", "batches"),
+    [
+        pytest.param(NUM_CAPTURED_TOKENS, BATCHES, id="more_tokens_than_sequences"),
+        pytest.param(
+            NUM_SMALL_CAPTURED_TOKENS, SMALL_BATCHES, id="fewer_tokens_than_sequences"
+        ),
+    ],
+)
 @pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
 @pytest.mark.parametrize("fused_norm", [False, True])
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 def test_captured_static_core_matches_eager(
-    state_dtype: torch.dtype, fused_norm: bool, mamba_cache_mode: str
+    state_dtype: torch.dtype,
+    fused_norm: bool,
+    mamba_cache_mode: str,
+    num_captured_tokens: int,
+    batches: dict[str, tuple],
 ) -> None:
     from vllm.utils.torch_utils import _current_stream_tls
 
@@ -264,11 +309,11 @@ def test_captured_static_core_matches_eager(
     )
     # Static inputs of the graph; their pad rows hold random tokens too.
     inputs = {
-        "mixed_qkv": torch.empty(NUM_CAPTURED_TOKENS, CONV_DIM),
-        "b": torch.empty(NUM_CAPTURED_TOKENS, HV),
-        "a": torch.empty(NUM_CAPTURED_TOKENS, HV),
-        "output_gate": torch.empty(NUM_CAPTURED_TOKENS, HV, V),
-        "core_attn_out": torch.empty(NUM_CAPTURED_TOKENS, HV, V),
+        "mixed_qkv": torch.empty(num_captured_tokens, CONV_DIM),
+        "b": torch.empty(num_captured_tokens, HV),
+        "a": torch.empty(num_captured_tokens, HV),
+        "output_gate": torch.empty(num_captured_tokens, HV, V),
+        "core_attn_out": torch.empty(num_captured_tokens, HV, V),
     }
     inputs = {
         name: x.to(device=device, dtype=torch.bfloat16).normal_(0, 0.1)
@@ -278,7 +323,7 @@ def test_captured_static_core_matches_eager(
     prev_stream = getattr(_current_stream_tls, "value", None)
     try:
         with torch.cuda.stream(torch.cuda.Stream()):
-            meta = _build(builder, "spec_and_prefill", device)
+            meta = _build(builder, batches["spec_and_prefill"], device)
             with (
                 _forward_context(meta, CUDAGraphMode.PIECEWISE),
                 BreakableCUDAGraphCapture() as capture,
@@ -288,8 +333,8 @@ def test_captured_static_core_matches_eager(
                 _run_core(captured, fused_norm, inputs)
             assert capture.num_eager_breaks == 0
 
-            for name in BATCHES:
-                meta = _build(builder, name, device)
+            for name in batches:
+                meta = _build(builder, batches[name], device)
                 for tensor in inputs.values():
                     tensor.normal_(0, 0.1)
                 for layer in (captured, eager):

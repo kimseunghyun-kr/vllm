@@ -103,6 +103,7 @@ from vllm.v1.attention.backends.gdn_attn import (
     CAUSAL_CONV1D_BLOCK_M,
     FLASHINFER_GDN_CHECKPOINT_ALIGNMENT,
     GDNAttentionMetadata,
+    capture_views,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -2249,18 +2250,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """Branch-free `_forward_core` for CUDA graph capture.
 
         The graph captured for `num_tokens` tokens replays for every batch
-        padded to that size, so this reads only `attn_metadata.capture_buffers`
-        at full length and sizes every grid by `num_tokens` and the buffer
-        capacity `num_seqs`. It always runs the spec decodes, the decodes it
-        peels off the non-spec rows, and the prefills; a part that the batch
-        lacks has only zero-length sequences or pad programs, which exit. Each
-        part runs the kernels that `_forward_core` runs for a batch with
-        prefills, and pad rows write only the null state block and a scratch
-        output row.
+        padded to that size, so this reads only the `capture_views` of
+        `attn_metadata.capture_buffers` at full length and sizes every grid by
+        `num_tokens` and their sequence rows `num_seqs`. It always runs the
+        spec decodes, the decodes it peels off the non-spec rows, and the
+        prefills; a part that the batch lacks has only zero-length sequences
+        or pad programs, which exit. Each part runs the kernels that
+        `_forward_core` runs for a batch with prefills, and pad rows write
+        only the null state block and a scratch output row.
         """
-        buffers = attn_metadata.capture_buffers
-        assert buffers is not None
+        assert attn_metadata.capture_buffers is not None
         num_tokens = mixed_qkv.shape[0]
+        buffers = capture_views(attn_metadata.capture_buffers, num_tokens)
         num_seqs = buffers["non_spec_state_indices_tensor"].shape[0]
         conv_state = (
             self.kv_cache[0]
@@ -2271,8 +2272,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # (dim, width) view of the (dim, 1, width) weight.
         conv_weights = self.conv1d.weight.squeeze(1)
         # Pad rows of the token indices gather token 0.
-        spec_token_indx = buffers["spec_token_indx"][:num_tokens]
-        non_spec_token_indx = buffers["non_spec_token_indx"][:num_tokens]
+        spec_token_indx = buffers["spec_token_indx"]
+        non_spec_token_indx = buffers["non_spec_token_indx"]
 
         # 1. Spec decodes.
         spec_state_indices = buffers["spec_state_indices_tensor"]
