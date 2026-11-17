@@ -858,11 +858,11 @@ def test_capture_buffers_hold_any_batch(update_block_table: bool, mamba_cache_mo
         assert meta.nums_dict[8]["tot"] == num_programs
 
 
-# Batches whose sequences have one token each: they fill every sequence row
-# of a graph with as many tokens.
+# A batch whose sequences have one token each: it fills every sequence row of
+# a graph with as many tokens. Its rows have earlier tokens, as the decodes
+# that `_expected_capture_rows` expects in a batch without prefills.
 ONE_TOKEN_BATCHES = {
     "one_token_decodes": ([40, 30, 20, 25], [1, 1, 1, 1], None),
-    "one_token_first_chunks": ([1, 1, 1], [1, 1, 1], None),
 }
 
 
