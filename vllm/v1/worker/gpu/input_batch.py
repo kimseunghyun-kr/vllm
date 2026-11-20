@@ -569,6 +569,9 @@ def _post_update_kernel(
     last_sampled_tokens_ptr,
     output_bin_counts_ptr,
     output_bin_counts_stride,
+    output_tokens_ptr,
+    output_tokens_stride,
+    num_output_tokens_ptr,
     sampled_tokens_ptr,
     sampled_tokens_stride,
     num_sampled_ptr,
@@ -618,6 +621,17 @@ def _post_update_kernel(
             )
             count = tl.load(token_ptr)
             tl.store(token_ptr, count + 1)
+            if output_tokens_ptr is not None and count == 0:
+                # First occurrence: list the token for the sparse penalties.
+                num_output_tokens = tl.load(num_output_tokens_ptr + req_state_idx)
+                if num_output_tokens < output_tokens_stride:
+                    tl.store(
+                        output_tokens_ptr
+                        + req_state_idx * output_tokens_stride
+                        + num_output_tokens,
+                        token_id,
+                    )
+                tl.store(num_output_tokens_ptr + req_state_idx, num_output_tokens + 1)
 
     if query_start_loc_ptr is None:
         query_len = 0
@@ -658,6 +672,10 @@ def post_update(
     draft_tokens: torch.Tensor | None = None,
     # [max_num_reqs, num_speculative_steps], contiguous; required with draft_tokens
     draft_tokens_out: torch.Tensor | None = None,
+    # [max_num_reqs, capacity] and [max_num_reqs]: each request's distinct
+    # output tokens, kept only with output_bin_counts
+    output_tokens: torch.Tensor | None = None,
+    num_output_tokens: torch.Tensor | None = None,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
     if draft_tokens is not None:
@@ -671,6 +689,9 @@ def post_update(
         last_sampled_tokens,
         output_bin_counts,
         output_bin_counts.stride(0) if output_bin_counts is not None else 0,
+        output_tokens,
+        output_tokens.stride(0) if output_tokens is not None else 0,
+        num_output_tokens,
         sampled_tokens,
         sampled_tokens.stride(0),
         num_sampled,
