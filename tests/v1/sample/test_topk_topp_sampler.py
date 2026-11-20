@@ -1231,7 +1231,11 @@ def test_topk_split_matches_one_program(monkeypatch, batch_size, vocab_size, mod
         p = torch.tensor([0.95, 1.0, 0.5, 0.9], device=DEVICE_TYPE)[rows % 4]
     else:
         k = torch.full((batch_size,), 20, device=DEVICE_TYPE)
-        p = None if mode == "topk" else torch.full((batch_size,), 0.95, device=DEVICE_TYPE)
+        p = (
+            None
+            if mode == "topk"
+            else torch.full((batch_size,), 0.95, device=DEVICE_TYPE)
+        )
     k = k.to(torch.int32)
 
     monkeypatch.setattr(tt, "_topk_split_max_rows", lambda vocab: 0)

@@ -201,12 +201,22 @@ def _topk_topp_kernel(
                         num_finite_total += tl.load(SPLIT_FINITE + stat)
                         cnt = tl.load(SPLIT_OUTLIERS + stat)
                         if s > 0:
-                            for j in range(0, (cnt + BLOCK_SIZE_TRUNC - 1) // BLOCK_SIZE_TRUNC):
-                                offs_c = j * BLOCK_SIZE_TRUNC + tl.arange(0, BLOCK_SIZE_TRUNC)
+                            for j in range(
+                                0, (cnt + BLOCK_SIZE_TRUNC - 1) // BLOCK_SIZE_TRUNC
+                            ):
+                                offs_c = j * BLOCK_SIZE_TRUNC + tl.arange(
+                                    0, BLOCK_SIZE_TRUNC
+                                )
                                 mask_c = offs_c < cnt
-                                moved = tl.load(BUFFER_ROW + s * SPLIT_LEN + offs_c, mask=mask_c)
+                                moved = tl.load(
+                                    BUFFER_ROW + s * SPLIT_LEN + offs_c, mask=mask_c
+                                )
                                 tl.debug_barrier()
-                                tl.store(BUFFER_ROW + num_outliers + offs_c, moved, mask=mask_c)
+                                tl.store(
+                                    BUFFER_ROW + num_outliers + offs_c,
+                                    moved,
+                                    mask=mask_c,
+                                )
                                 tl.debug_barrier()
                         num_outliers += cnt
                 else:
@@ -912,7 +922,9 @@ def _topk_topp_kernel(
                             tl.abs(logits_blk - duplicate_logit) < 1e-9
                         ) & mask_n
                         duplicate_count = tl.cumsum(duplicate_mask) + num_kept
-                        duplicate_keep_mask = (duplicate_count <= num_keep) & duplicate_mask
+                        duplicate_keep_mask = (
+                            duplicate_count <= num_keep
+                        ) & duplicate_mask
                         duplicate_remove_mask = duplicate_mask & ~duplicate_keep_mask
                         num_kept += tl.sum(duplicate_keep_mask)
                         keep_mask = keep_mask & (~duplicate_remove_mask)
@@ -1071,7 +1083,6 @@ def _topk_split_mask_kernel(
             )
 
 
-
 def _max_sampler_batch_size(vllm_config: Any) -> int:
     return vllm_config.scheduler_config.max_num_seqs * (
         vllm_config.num_speculative_tokens + 1
@@ -1190,8 +1201,8 @@ def _topk_topp(
 # them. This is deterministic (same inputs, same code) and far cheaper than
 # a vocab sweep, and it saves a kernel launch per combine. The pipeline
 # handles only "p-only" rows (p < 1 and no active top-k); rows with an
-# active top-k are left to the monolithic kernel, whose truncation path is
-# already fast for them.
+# active top-k are left to the monolithic kernel, whose full-vocab passes
+# _apply_topk_split splits for small and medium batches.
 # ---------------------------------------------------------------------------
 
 _SPLIT_MAX_BATCH = 64
@@ -1864,25 +1875,52 @@ def _apply_topk_split(
         chunk_k = k[start : start + rows]
         chunk_p = p[start : start + rows] if p is not None else None
         _topk_split_pivot_kernel[(rows,)](
-            chunk, chunk.stride(0), ws[6], percentile_to_std_table, chunk_k,
-            VOCAB_SIZE=vocab_size, BLOCK_SIZE=8192, num_warps=8,
+            chunk,
+            chunk.stride(0),
+            ws[6],
+            percentile_to_std_table,
+            chunk_k,
+            VOCAB_SIZE=vocab_size,
+            BLOCK_SIZE=8192,
+            num_warps=8,
         )
         _topk_split_gather_kernel[(rows, splits)](
-            chunk, chunk.stride(0), buffer, *ws[:4], ws[6], chunk_k,
-            VOCAB_SIZE=vocab_size, GATHER_BLOCK=gather_block, NUM_SPLITS=splits,
-            SPLIT_LEN=split_len, BUFFER_ROW_LEN=splits * split_len,
+            chunk,
+            chunk.stride(0),
+            buffer,
+            *ws[:4],
+            ws[6],
+            chunk_k,
+            VOCAB_SIZE=vocab_size,
+            GATHER_BLOCK=gather_block,
+            NUM_SPLITS=splits,
+            SPLIT_LEN=split_len,
+            BUFFER_ROW_LEN=splits * split_len,
             num_warps=_TOPK_SPLIT_WARPS,
         )
         _topk_topp(
-            chunk, buffer, percentile_to_std_table, normal_cdf_to_sigma_table,
-            chunk_k, chunk_p, mask_value, num_sm,
-            split_ws=ws[:6], num_splits=splits, split_len=split_len,
+            chunk,
+            buffer,
+            percentile_to_std_table,
+            normal_cdf_to_sigma_table,
+            chunk_k,
+            chunk_p,
+            mask_value,
+            num_sm,
+            split_ws=ws[:6],
+            num_splits=splits,
+            split_len=split_len,
             full_batch_size=batch_size,
         )
         _topk_split_mask_kernel[(rows, splits)](
-            chunk, chunk.stride(0), ws[4], ws[5],
-            MASK_VALUE=mask_value, VOCAB_SIZE=vocab_size,
-            GATHER_BLOCK=gather_block, SPLIT_LEN=split_len,
+            chunk,
+            chunk.stride(0),
+            ws[4],
+            ws[5],
+            MASK_VALUE=mask_value,
+            VOCAB_SIZE=vocab_size,
+            GATHER_BLOCK=gather_block,
+            SPLIT_LEN=split_len,
             num_warps=_TOPK_SPLIT_WARPS,
         )
 
@@ -1946,8 +1984,8 @@ def apply_top_k_top_p_triton(
     # At small batch sizes the monolithic kernel's standalone top-p path is
     # latency-bound (one program per row, serial vocab sweeps), so use the
     # split-row pipeline for rows without an active top-k. Rows with an
-    # active top-k still go through the monolithic kernel (its truncation
-    # path is already fast). The monolithic's standalone top-p branch then
+    # active top-k still go through the monolithic kernel (with its
+    # full-vocab passes split below). The monolithic's standalone top-p branch then
     # covers only rows whose top-k is a no-op (k < vocab but <= k finite
     # logits, e.g. grammar masks), which the split pipeline skips.
     use_split = (
