@@ -10,12 +10,14 @@ import torch.nn.functional as F
 
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
+    get_tp_group,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_gather,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.model_executor.layers.local_argmax import pack_top, select_top
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
@@ -240,27 +242,30 @@ class LogitsProcessor(PluggableLayer):
 
         self._mask_outside_vocab(logits, lm_head)
 
-        local_max_vals, local_max_indices = logits.max(dim=-1)
-
-        # Convert shard-local indices to global vocab indices.
-        vocab_start = lm_head.shard_indices.org_vocab_start_index
-        global_indices = local_max_indices + vocab_start
+        local_pair = pack_top(logits, lm_head.shard_indices.org_vocab_start_index)
 
         if tp_size == 1:
-            return global_indices
+            return local_pair[:, 1].to(torch.int64)
 
-        # All-gather (value, index) pairs, then reduce to global argmax.
-        # Use float32 to avoid bf16 precision loss on large vocab indices.
-        local_pair = torch.stack(
-            [local_max_vals.float(), global_indices.float()], dim=-1
+        return select_top(self._gather_top_pairs(local_pair, tp_size), tp_size)
+
+    @staticmethod
+    def _gather_top_pairs(local_pair: torch.Tensor, tp_size: int) -> torch.Tensor:
+        """`[batch, 2]` of every rank to `[batch, tp_size, 2]`. The payload is
+        a few hundred bytes: the custom all-gather serves it when available."""
+        rows = local_pair.shape[0]
+        custom_all_gather = getattr(
+            get_tp_group().device_communicator, "custom_all_gather", None
         )
-        # [batch, 2] -> [batch, 2 * tp_size]
+        if custom_all_gather is not None:
+            # The custom all-gather takes multiples of 16 bytes: pad to even rows.
+            padded = torch.nn.functional.pad(local_pair, (0, 0, 0, rows % 2))
+            gathered = custom_all_gather(padded)
+            if gathered is not None:
+                gathered = gathered.view(tp_size, -1, 2)[:, :rows]
+                return gathered.transpose(0, 1).contiguous()
         gathered = tensor_model_parallel_all_gather(local_pair, dim=-1)
-        # [batch, tp_size, 2] where [:, :, 0]=values, [:, :, 1]=indices
-        gathered = gathered.view(hidden_states.shape[0], tp_size, 2)
-        max_rank_idx = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
-        top_tokens = gathered[:, :, 1].gather(dim=-1, index=max_rank_idx)
-        return top_tokens.squeeze(-1).to(torch.int64)
+        return gathered.view(rows, tp_size, 2)
 
     def get_top_k_tokens(
         self,
