@@ -94,7 +94,7 @@ class Sampler:
         # forcing, logits processors) rather than only scale them.
         self.may_mask_logits = np.zeros(max_num_reqs, dtype=bool)
         # Whether a request's token depends only on its top-k processed logits,
-        # through processing that `process_shard` supports.
+        # through processing that `shard_candidates` applies.
         self.candidate_eligible = np.zeros(max_num_reqs, dtype=bool)
         self.has_custom_logits_processors = bool(custom_logits_processors)
         self.num_speculative_tokens = num_speculative_tokens
@@ -110,13 +110,24 @@ class Sampler:
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         needs_processing = self.sampling_states.add_request(req_idx, sampling_params)
         may_mask = self.sampling_states.masks_logits(req_idx)
-        may_mask |= self.thinking_budget_state.add_request(req_idx, sampling_params)
+        # Processing that `shard_candidates` does not apply: the thinking budget
+        # and every logits processor except the penalties, for example the
+        # min-tokens stop-token mask of the logit bias processor.
+        unsupported_processing = self.thinking_budget_state.add_request(
+            req_idx, sampling_params
+        )
         for processor in self.logits_processors:
-            may_mask |= processor.add_request(req_idx, sampling_params)
+            applies = processor.add_request(req_idx, sampling_params)
+            may_mask |= applies
+            if processor is not self.penalties_state:
+                unsupported_processing |= applies
+        may_mask |= unsupported_processing
         self.needs_logits_processing[req_idx] = needs_processing or may_mask
         self.may_mask_logits[req_idx] = may_mask
 
-        self.candidate_eligible[req_idx] = self._is_candidate_eligible(sampling_params)
+        self.candidate_eligible[req_idx] = (
+            not unsupported_processing and self._is_candidate_eligible(sampling_params)
+        )
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         if self.trace_replay_state is not None:
             self.trace_replay_state.add_request(req_idx, sampling_params)

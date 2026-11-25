@@ -676,3 +676,12 @@ def test_sampler_shard_candidates_match_apply_sampling_params(monkeypatch):
     assert not sampler.supports_candidates(idx_mapping_np)
     sampler.add_request(0, SamplingParams(temperature=1.0, top_p=0.9))
     assert not sampler.supports_candidates(idx_mapping_np)
+    # min_tokens masks the stop tokens in the logit bias processor, which
+    # `shard_candidates` does not apply.
+    sampler.add_request(
+        0,
+        SamplingParams(temperature=1.0, top_k=20, min_tokens=4, stop_token_ids=[2]),
+    )
+    assert not sampler.supports_candidates(idx_mapping_np)
+    sampler.add_request(0, SamplingParams(temperature=1.0, top_k=20, min_tokens=4))
+    assert sampler.supports_candidates(idx_mapping_np)
