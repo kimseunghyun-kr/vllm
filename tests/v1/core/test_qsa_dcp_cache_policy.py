@@ -32,9 +32,9 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
+    get_block_table_width,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
-from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.gpu import attn_utils
 from vllm.v1.worker.utils import (
     AttentionGroup,
