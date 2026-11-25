@@ -942,3 +942,41 @@ def test_captures_mixed_batches_unless_checkpoints_are_exported(
             device=DEVICE,
         )
     assert builder.captures_mixed_batches is expected
+
+
+@pytest.mark.parametrize("use_breakable_cudagraph", [True, False])
+def test_captures_mixed_batches_follows_compilation_config(
+    monkeypatch: pytest.MonkeyPatch, use_breakable_cudagraph: bool
+):
+    """Since vllm#65091 the resolved breakable CUDA graph state lives in the
+    compilation config and is not written to VLLM_USE_BREAKABLE_CUDAGRAPH, so
+    the GDN capture must follow the config, not the environment variable."""
+    from unittest.mock import PropertyMock, patch
+
+    from vllm.config import VllmConfig
+    from vllm.v1.attention.backends import gdn_attn
+
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+    vllm_config = create_vllm_config(
+        model_name="Qwen/Qwen3.5-0.8B", block_size=BLOCK_SIZE
+    )
+    compilation_config = vllm_config.compilation_config
+    compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    compilation_config.use_breakable_cudagraph = use_breakable_cudagraph
+    mamba_spec = MambaSpec(
+        block_size=BLOCK_SIZE, shapes=((16, 64),), dtypes=(torch.float16,)
+    )
+    with (
+        patch.object(gdn_attn.current_platform, "is_cuda", return_value=True),
+        patch.object(
+            VllmConfig, "use_v2_model_runner", new_callable=PropertyMock
+        ) as use_v2_model_runner,
+    ):
+        use_v2_model_runner.return_value = True
+        builder = GDNAttentionMetadataBuilder(
+            kv_cache_spec=mamba_spec,
+            layer_names=["layer.0"],
+            vllm_config=vllm_config,
+            device=DEVICE,
+        )
+    assert builder.captures_mixed_batches is use_breakable_cudagraph
