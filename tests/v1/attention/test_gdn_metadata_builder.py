@@ -911,9 +911,8 @@ def test_captures_mixed_batches_unless_checkpoints_are_exported(
 ):
     """The GDN core is captured with prefix caching ("align" mode) too, unless
     the layer exports prefill checkpoints, which the captured core cannot."""
-    from unittest.mock import PropertyMock, patch
+    from unittest.mock import patch
 
-    from vllm.config import VllmConfig
     from vllm.v1.attention.backends import gdn_attn
 
     vllm_config = create_vllm_config(
@@ -930,11 +929,7 @@ def test_captures_mixed_batches_unless_checkpoints_are_exported(
     with (
         patch.object(gdn_attn, "is_breakable_cudagraph_enabled", return_value=True),
         patch.object(gdn_attn.current_platform, "is_cuda", return_value=True),
-        patch.object(
-            VllmConfig, "use_v2_model_runner", new_callable=PropertyMock
-        ) as use_v2_model_runner,
     ):
-        use_v2_model_runner.return_value = True
         builder = GDNAttentionMetadataBuilder(
             kv_cache_spec=mamba_spec,
             layer_names=["layer.0"],
@@ -951,9 +946,8 @@ def test_captures_mixed_batches_follows_compilation_config(
     """Since vllm#65091 the resolved breakable CUDA graph state lives in the
     compilation config and is not written to VLLM_USE_BREAKABLE_CUDAGRAPH, so
     the GDN capture must follow the config, not the environment variable."""
-    from unittest.mock import PropertyMock, patch
+    from unittest.mock import patch
 
-    from vllm.config import VllmConfig
     from vllm.v1.attention.backends import gdn_attn
 
     monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
@@ -966,13 +960,7 @@ def test_captures_mixed_batches_follows_compilation_config(
     mamba_spec = MambaSpec(
         block_size=BLOCK_SIZE, shapes=((16, 64),), dtypes=(torch.float16,)
     )
-    with (
-        patch.object(gdn_attn.current_platform, "is_cuda", return_value=True),
-        patch.object(
-            VllmConfig, "use_v2_model_runner", new_callable=PropertyMock
-        ) as use_v2_model_runner,
-    ):
-        use_v2_model_runner.return_value = True
+    with patch.object(gdn_attn.current_platform, "is_cuda", return_value=True):
         builder = GDNAttentionMetadataBuilder(
             kv_cache_spec=mamba_spec,
             layer_names=["layer.0"],

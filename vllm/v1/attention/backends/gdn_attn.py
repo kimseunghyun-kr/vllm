@@ -316,8 +316,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
         self.mixed_batch_buffers = self._allocate_mixed_batch_buffers(device)
         # A breakable CUDA graph also captures the GDN core when its static
-        # form applies: Triton/FLA kernels, no prefix-cache checkpoints, MRV2
-        # on CUDA. The graph of a token count replays for every batch of that
+        # form applies: Triton/FLA kernels, no prefix-cache checkpoints, CUDA
+        # (MRV2 is the only model runner since vllm#63373). The graph of a token count replays for every batch of that
         # count, with or without prefills, so build() then stages every batch.
         # Mamba "align" mode qualifies when the layer exports no prefill
         # checkpoint: the scheduler then ends each prefill chunk at a block
@@ -326,7 +326,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self.captures_mixed_batches = (
             is_breakable_cudagraph_enabled(self.compilation_config)
             and self.compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
-            and vllm_config.use_v2_model_runner
             and current_platform.is_cuda()
             and self.gdn_prefill_backend == "triton"
             and kv_cache_spec.num_prefill_checkpoint_blocks == 0
