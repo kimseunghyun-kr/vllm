@@ -166,6 +166,13 @@ def _create_gdn_builder(
     vllm_config.compilation_config.cudagraph_mode = (
         CUDAGraphMode.FULL_AND_PIECEWISE if full_cuda_graph else CUDAGraphMode.NONE
     )
+    # These builders test the path without the mixed-batch GDN capture; the
+    # capture tests set captures_mixed_batches themselves. On CUDA, VllmConfig
+    # turns on breakable CUDA graphs for Qwen3.5 in the compilation config,
+    # which the capture reads since vllm#65091. Before that, the capture read
+    # VLLM_USE_BREAKABLE_CUDAGRAPH, which create_vllm_config restores, so the
+    # capture stayed off here.
+    vllm_config.compilation_config.use_breakable_cudagraph = False
     if num_speculative_tokens > 0:
         vllm_config.speculative_config = SpeculativeConfig(
             method="ngram",

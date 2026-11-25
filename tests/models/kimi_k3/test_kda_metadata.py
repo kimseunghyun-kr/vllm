@@ -125,6 +125,13 @@ def _make_builder(
     vllm_config.compilation_config.cudagraph_mode = (
         CUDAGraphMode.FULL_AND_PIECEWISE if full_cuda_graph else CUDAGraphMode.NONE
     )
+    # These builders test the path without the mixed-batch GDN capture; the
+    # capture tests set captures_mixed_batches themselves. On CUDA, VllmConfig
+    # turns on breakable CUDA graphs for Qwen3.5 in the compilation config,
+    # which the capture reads since vllm#65091. Before that, the capture read
+    # VLLM_USE_BREAKABLE_CUDAGRAPH, which create_vllm_config restores, so the
+    # capture stayed off here.
+    vllm_config.compilation_config.use_breakable_cudagraph = False
     vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
     vllm_config.cache_config.use_replayssm = use_recoverssm
     vllm_config.cache_config.use_kda_recoverssm = use_recoverssm
@@ -225,6 +232,8 @@ def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
             cudagraph_mode=CUDAGraphMode.NONE,
             max_cudagraph_capture_size=None,
             static_forward_context={},
+            # The GDN builder reads it for the mixed-batch capture.
+            use_breakable_cudagraph=False,
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=64),
         additional_config={},
