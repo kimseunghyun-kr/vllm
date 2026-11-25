@@ -547,9 +547,8 @@ def test_qsa_side_cache_builder_keeps_spec_rows_as_decodes(dcp_world_size):
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(decode_context_parallel_size=dcp_world_size),
         speculative_config=SimpleNamespace(
-            num_speculative_tokens=3, parallel_drafting=False
+            num_speculative_tokens=3, max_num_new_slots_for_drafting=0
         ),
-        use_v2_model_runner=True,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=64, max_num_seqs=4),
     )
     builder = QSAIndexerMetadataBuilder(
